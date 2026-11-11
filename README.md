@@ -424,7 +424,9 @@ Put all three in `data/source/nsduh/2024/`. Record the file names and download d
 ### 3b. Athena vocabularies
 
 1. Sign in at <https://athena.ohdsi.org/> → **Download**.
-2. Select at least **SNOMED, RxNorm, RxNorm Extension, LOINC, CVX, Cancer Modifier, and Gender/Race/Ethnicity/Visit/Domain** (the defaults include most of these).
+2. Start from Athena's **defaults** and **add CVX and Cancer Modifier**. Neither is a default, and Synthea needs both. Core vocabularies like UCUM, Visit, Domain and the Type concepts come with every bundle automatically.
+
+   > ⚠ **Don't skip CVX.** Synthea codes every **immunization** in CVX. Without it, ETL-Synthea **drops** immunization records rather than mapping them to `0`, so they never reach `drug_exposure`, and the unmapped count stays at zero, which hides the loss. In the pilot, `drug_exposure` held exactly the medication count, so all **2,711** immunizations appear to have gone missing this way (confirm with the reconciliation queries in Step 7a).
 
    > ⚠ **Don't skip Cancer Modifier.** OMOP maps SNOMED *metastasis* concepts (e.g. `94260004` "Metastatic malignant neoplasm to colon") to **Cancer Modifier**, and Synthea's cancer modules produce them. Without it, Athena leaves the `Maps to` row out of `CONCEPT_RELATIONSHIP.csv` and keeps only the `Maps to value → Positive` half, so those records map to `0`. In the pilot this silently dropped 3 deaths (Step 7b). **General rule:** if a concept has `Maps to value` but no `Maps to`, check its page on Athena; the missing target is usually in a vocabulary you didn't select.
 3. Unzip into `data/vocab/athena/` so that `CONCEPT.csv` sits directly in that folder.
@@ -1312,14 +1314,25 @@ SELECT DISTINCT co.condition_source_value, co.condition_concept_id, c.concept_na
  WHERE co.condition_source_value IN ('370143000', '7200002');
 ```
 
-**Reconcile counts at every stage.** For example, compare deceased patients in staging with rows in `cdm.death`:
+**Reconcile counts at every stage.** "Zero unmapped" is *not* proof that nothing was lost: when the ETL **drops** a row instead of mapping it to `0`, the unmapped count stays clean while records disappear. Compare staging with the CDM directly:
 
 ```sql
+-- Deaths: deceased patients in staging vs rows in cdm.death (if these differ, see 7b)
 SELECT (SELECT COUNT(*) FROM synthea.patients WHERE deathdate IS NOT NULL) AS deceased_in_synthea,
        (SELECT COUNT(*) FROM cdm.death)                                    AS rows_in_cdm_death;
+
+-- Drugs: medications + immunizations staged vs rows in cdm.drug_exposure
+SELECT (SELECT COUNT(*) FROM synthea.medications)   AS medications_staged,
+       (SELECT COUNT(*) FROM synthea.immunizations) AS immunizations_staged,
+       (SELECT COUNT(*) FROM cdm.drug_exposure)     AS drug_exposure_rows;
+
+-- Immunizations specifically: did any land in drug_exposure? (0 here = CVX missing)
+SELECT COUNT(*) AS immunizations_in_cdm
+  FROM cdm.drug_exposure
+ WHERE drug_source_value IN (SELECT DISTINCT code FROM synthea.immunizations);
 ```
 
-If those differ, see 7b. Comparing CSV → staging → CDM counts is how the pilot found its missing records.
+Comparing CSV → staging → CDM counts is how the pilot found both of its gaps. `drug_exposure` held exactly the 28,265 medications and apparently none of the 2,711 immunizations (CVX missing), and `cdm.death` was 18 short (7b). Expect `drug_exposure_rows` to be **close to, not exactly**, medications + immunizations, since the ETL can legitimately merge or split some records. A gap the size of a whole source table is never legitimate.
 
 ### 7b. Known ETL-Synthea gap: dropped deaths
 
@@ -1556,7 +1569,7 @@ Networking: put both stacks on a shared Docker network, or point Broadsea at `ho
 - [ ] Module probabilities generated from JSON, not hand-typed
 - [ ] New `RUN_ID`; `COMMAND.txt` present in the output folder
 - [ ] `run-log.md` row complete: versions, seed, hashes, vocab release
-- [ ] Athena bundle includes **Cancer Modifier**; only the 10 vocabulary CSVs are in `data/vocab/athena/`
+- [ ] Athena bundle includes **CVX** and **Cancer Modifier** (`cut -f1 data/vocab/athena/VOCABULARY.csv | sort`); only the 10 vocabulary CSVs are in `data/vocab/athena/`
 - [ ] ETL finished without errors; `cdm.cdm_source` row describes the run
 - [ ] Step 7a counts reconcile (`person` = patients, `death` = deceased after the 7b patch)
 - [ ] Unmapped-codes worklist (7a query 4) reviewed; new retired codes added to `docs/assumptions.md`
@@ -1590,6 +1603,7 @@ Networking: put both stacks on a shared Docker network, or point Broadsea at `ho
 | Joint proportions skewed high | Built-in Synthea modules adding the same disorders | Filter modules with `-m`, or exclude them in validation |
 | Nobody in the "both" cell | Guard `year` is later than the simulation end date | Line the Guard up with the run's end date (A-001) |
 | Port 5432 in use | Local Postgres already running | Set `OMOP_DB_PORT=5433` in `.env` |
+| Immunizations missing from `drug_exposure`, yet "0 unmapped" | CVX isn't in the vocabulary bundle, so the ETL drops immunizations instead of mapping them to `0` | Add **CVX** in Athena (Step 3b), reload, then rerun the 7a reconciliation queries |
 | `cdm.death` has fewer rows than deceased patients | `insert_death.sql` drops deaths with no death-cert encounter or an unmapped cause | Step 7b: diagnose, then run `patch_missing_deaths.sql` |
 | A concept has `Maps to value` but no `Maps to` | Its `Maps to` target is in a vocabulary you didn't download (e.g. Cancer Modifier) | Check the concept on athena.ohdsi.org; add that vocabulary to the bundle and reload |
 | Common Synthea codes map to `0` | Synthea uses some SNOMED codes **retired** after it was written (`invalid_reason = 'D'`) | Expected. List them with 7a query 4 and record each in `docs/assumptions.md`; any mapping is a terminology-review decision |
