@@ -147,11 +147,14 @@ value **positive**."* OMOP models a metastasis as a **modifier** of the primary 
 a separate disease. So a source "condition" becomes a **Measurement-domain** record. That's
 section 4 in action.
 
-> **Case study:** the project's first vocabulary download didn't include **Cancer Modifier**.
-> Athena leaves out relationships that point into vocabularies you didn't select, so the
-> `Maps to` row was missing and only the `Maps to value → Positive` half arrived. The ETL found
-> no standard concept, and three death records were dropped. **A `Maps to value` with no
-> `Maps to` is a red flag for a missing vocabulary.** Lesson 004 tells the whole story.
+> **Case study, in two acts.** *Act 1:* the project's first vocabulary download didn't include
+> **Cancer Modifier**. Athena leaves out relationships that point into vocabularies you didn't
+> select, so the `Maps to` row was missing and only the `Maps to value → Positive` half arrived.
+> **A `Maps to value` with no `Maps to` is a red flag for a missing vocabulary.**
+> *Act 2:* after adding Cancer Modifier, the mapping appeared, but the three deaths were *still*
+> dropped. The ETL's death script only accepts causes whose standard concept is in the
+> **Condition** domain, and this one is a **Measurement**. Domains matter at every step, not just
+> when choosing a table. Lesson 004 tells the whole story.
 
 ---
 
@@ -227,7 +230,7 @@ to guess in code.
 
 Clinical tables store each coded value in **three** columns. Using `cdm.death` as an example:
 
-| Column | Holds | Example (a metastasis death, with Cancer Modifier loaded) |
+| Column | Holds | Example (a metastasis death, restored by the project's patch) |
 |---|---|---|
 | `cause_concept_id` | The **standard** concept: what analyses use | `35226112` (Metastasis to colon) |
 | `cause_source_value` | The **original** code, verbatim, as text | `94260004` |
@@ -252,8 +255,9 @@ Every domain table follows the same pattern: `condition_concept_id` /
 
 > **The trap:** an ETL that **drops** unmappable rows instead of using `0` breaks this
 > convention. Then the unmapped count looks clean while records quietly vanish. In the pilot,
-> deaths with unmapped causes and immunizations without the CVX vocabulary both disappeared
-> this way. **"Zero unmapped" is not the same as "nothing lost."**
+> 18 deaths with unmappable causes and all 2,711 immunizations (loaded without the CVX
+> vocabulary) disappeared this way, while the unmapped drug count read **0**.
+> **"Zero unmapped" is not the same as "nothing lost."**
 
 ---
 
@@ -392,7 +396,9 @@ colon cancer, using Query 6's ancestor. Then count how many you'd find matching
 2. **No.** `_concept_id` columns hold **standard** concepts. Follow its `Maps to` to the standard
    concept and store that. Keep the original in `_source_value` and `_source_concept_id`.
 3. **Not necessarily.** The standard concept's **domain** decides the table. Metastases, for
-   example, map to Cancer Modifier concepts in the **Measurement** domain.
+   example, map to Cancer Modifier concepts in the **Measurement** domain. (The flip side: code
+   that *assumes* a domain, like the ETL's Condition-only death script, can silently drop such
+   records.)
 4. The `Maps to` target is in a **vocabulary that wasn't downloaded**, so Athena left the row out.
    Look the concept up on athena.ohdsi.org and check which vocabulary its `Maps to` points into.
 5. `concept_ancestor` stores **every** ancestor–descendant pair at **every** depth (plus each

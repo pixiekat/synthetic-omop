@@ -427,9 +427,9 @@ Put all three in `data/source/nsduh/2024/`. Record the file names and download d
 1. Sign in at <https://athena.ohdsi.org/> → **Download**.
 2. Start from Athena's **defaults** and **add CVX and Cancer Modifier**. Neither is a default, and Synthea needs both. Core vocabularies like UCUM, Visit, Domain and the Type concepts come with every bundle automatically.
 
-   > ⚠ **Don't skip CVX.** Synthea codes every **immunization** in CVX. Without it, ETL-Synthea **drops** immunization records rather than mapping them to `0`, so they never reach `drug_exposure`, and the unmapped count stays at zero, which hides the loss. In the pilot, `drug_exposure` held exactly the medication count, so all **2,711** immunizations appear to have gone missing this way (confirm with the reconciliation queries in Step 7a).
+   > ⚠ **Don't skip CVX.** Synthea codes every **immunization** in CVX. Without it, ETL-Synthea **drops** immunization records rather than mapping them to `0`, so they never reach `drug_exposure`, and the unmapped count stays at zero, which hides the loss. In the pilot (no CVX), `drug_exposure` held exactly the 28,265 medications and no immunizations. Reloading with CVX brought back **2,685 of 2,711**. The remaining 26 are under investigation (see Step 7a); they're likely a domain filter or retired CVX codes, the same pattern as the deaths.
 
-   > ⚠ **Don't skip Cancer Modifier.** OMOP maps SNOMED *metastasis* concepts (e.g. `94260004` "Metastatic malignant neoplasm to colon") to **Cancer Modifier**, and Synthea's cancer modules produce them. Without it, Athena leaves the `Maps to` row out of `CONCEPT_RELATIONSHIP.csv` and keeps only the `Maps to value → Positive` half, so those records map to `0`. In the pilot this silently dropped 3 deaths (Step 7b). **General rule:** if a concept has `Maps to value` but no `Maps to`, check its page on Athena; the missing target is usually in a vocabulary you didn't select.
+   > ⚠ **Don't skip Cancer Modifier.** OMOP maps SNOMED *metastasis* concepts (e.g. `94260004` "Metastatic malignant neoplasm to colon") to **Cancer Modifier**, and Synthea's cancer modules produce them. Without it, Athena leaves the `Maps to` row out of `CONCEPT_RELATIONSHIP.csv` and keeps only the `Maps to value → Positive` half, so those records map to `0`. Without it, those concepts can't map at all. (Deaths with these causes *also* need the Step 7b patch, because `insert_death.sql` only accepts Condition-domain causes, and Cancer Modifier concepts are Measurements.) **General rule:** if a concept has `Maps to value` but no `Maps to`, check its page on Athena; the missing target is usually in a vocabulary you didn't select.
 3. Unzip into `data/vocab/athena/` so that `CONCEPT.csv` sits directly in that folder.
 4. **Optional: merge CPT4** (see 3c) **before** moving files around and before the first ETL run.
 5. **Move the non-vocabulary files out** so the ETL loader only sees OMOP tables:
@@ -953,7 +953,7 @@ Every simulation choice and every deviation from the standard ETL gets an ID, so
 | A-004 | Probabilities are uniform 0.25 placeholders for F 35–49 only | `Assign_Profile` | Pilot only; replace from NSDUH |
 | A-005 | Deaths dropped by ETL-Synthea are restored with `cause_concept_id = 0` | `services/etl/sql/patch_missing_deaths.sql` | Applied after every ETL |
 | A-006 | SNOMED `55680006` "Drug overdose" was retired in 2021 and has no `Maps to`; candidates 607147 "Overdose" / 4053782 "Overdose of opiate" | `cdm.death`, `cdm.condition_occurrence` | Unmapped (`0`) pending terminology review |
-| A-007 | SNOMED `94260004` maps to Cancer Modifier 35226112, which needs the Cancer Modifier vocabulary | Athena bundle (Step 3b) | Resolved by adding Cancer Modifier |
+| A-007 | SNOMED `94260004` maps to Cancer Modifier 35226112 (Measurement domain), which needs the Cancer Modifier vocabulary | Athena bundle (Step 3b); `cdm.death` via patch | Mapping resolved by adding Cancer Modifier; deaths still restored by the patch (ETL accepts Condition-domain causes only) |
 ```
 
 ### `services/synthea/keep/keep_concurrent.json` (optional)
@@ -1333,17 +1333,43 @@ SELECT COUNT(*) AS immunizations_in_cdm
  WHERE drug_source_value IN (SELECT DISTINCT code FROM synthea.immunizations);
 ```
 
-Comparing CSV → staging → CDM counts is how the pilot found both of its gaps. `drug_exposure` held exactly the 28,265 medications and apparently none of the 2,711 immunizations (CVX missing), and `cdm.death` was 18 short (7b). Expect `drug_exposure_rows` to be **close to, not exactly**, medications + immunizations, since the ETL can legitimately merge or split some records. A gap the size of a whole source table is never legitimate.
+Comparing CSV → staging → CDM counts is how the pilot found both of its gaps. Without CVX, `drug_exposure` held exactly the 28,265 medications and none of the 2,711 immunizations (with CVX: 2,685), and `cdm.death` was 18 short (7b).
+
+To find *which* records are missing, compare per code rather than in total:
+
+```sql
+-- Immunization codes whose staged count doesn't match what reached drug_exposure
+WITH staged AS (
+  SELECT code, MAX(description) AS description, COUNT(*) AS n
+    FROM synthea.immunizations GROUP BY code
+), loaded AS (
+  SELECT drug_source_value AS code, COUNT(*) AS n
+    FROM cdm.drug_exposure GROUP BY drug_source_value
+)
+SELECT s.code, s.description, s.n AS staged, COALESCE(l.n, 0) AS in_cdm
+  FROM staged s
+  LEFT JOIN loaded l USING (code)
+ WHERE COALESCE(l.n, 0) <> s.n;
+``` Expect `drug_exposure_rows` to be **close to, not exactly**, medications + immunizations, since the ETL can legitimately merge or split some records. A gap the size of a whole source table is never legitimate.
 
 ### 7b. Known ETL-Synthea gap: dropped deaths
 
-In the pilot, Synthea recorded **175** deaths but `cdm.death` held only **157**. `insert_death.sql` builds each death from the patient's **death-certification encounter** (SNOMED `308646001`) and **inner-joins** the cause of death to a standard concept. So a death is dropped entirely when:
+In the pilot, Synthea recorded **175** deaths but `cdm.death` held only **157**, both before and after adding the Cancer Modifier and CVX vocabularies. `insert_death.sql` builds each death from the patient's **death-certification encounter** (SNOMED `308646001`) and **inner-joins** the cause to ETL-Synthea's lookup table, accepting only Condition-domain causes. This is confirmed in the package SQL (`cdm_version/v540/insert_death.sql`, lines 30–33):
 
-| Reason | Pilot count | Example |
-|---|---|---|
-| No death-certification encounter | 8 | Nothing to build the row from |
-| Cause code has no standard `Maps to` | 7 | `55680006` "Drug overdose", retired from SNOMED in 2021 (A-006) |
-| Cause maps into a vocabulary not downloaded | 3 | `94260004` → Cancer Modifier 35226112 (A-007; fixed by Step 3b) |
+```sql
+join @cdm_schema.source_to_standard_vocab_map srctostdvm
+ ...
+ and srctostdvm.target_domain_id = 'Condition'
+ and srctostdvm.source_domain_id = 'Condition'
+```
+
+So a death is dropped entirely when:
+
+| Reason | Pilot count | Example | After the patch |
+|---|---|---|---|
+| No death-certification encounter | 8 | Nothing to build the row from | Restored, cause `0` |
+| Cause code has no standard `Maps to` | 7 | `55680006` "Drug overdose", retired from SNOMED in 2021 (A-006) | Restored, cause `0` |
+| Cause maps to a **non-Condition** domain | 3 | `94260004` → Cancer Modifier 35226112, a **Measurement** (A-007) | Restored **with** cause 35226112, if Cancer Modifier is loaded |
 
 That goes against OMOP's own convention, which is to **keep the record** with `concept_id = 0` when a value doesn't map. It also matters here specifically: in an SUD project, the deaths dropped most were **drug overdoses**.
 
@@ -1435,9 +1461,9 @@ docker compose exec -T omop-db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"
   < services/etl/sql/patch_missing_deaths.sql
 ```
 
-Afterwards, `cdm.death` should match `deceased_in_synthea` from 7a. With Cancer Modifier in the vocabulary, the ETL itself handles the metastasis causes, so the patch inserts fewer rows (15 rather than 18 in the pilot).
+Afterwards, `cdm.death` should match `deceased_in_synthea` from 7a. In the pilot, the patch reported `INSERT 0 18` and the totals reconciled at **175 / 175**. The Cancer Modifier vocabulary doesn't change how many rows the patch inserts, because the ETL's domain filter still drops those three. What it changes is the **quality** of the restored rows: the patch has no domain filter, so the metastasis deaths get their real cause (35226112) instead of `0`.
 
-> This is also worth reporting upstream on the OHDSI/ETL-Synthea GitHub: dropping a whole death record over an unmapped cause contradicts the OMOP convention. The diagnostic queries above are a complete reproduction.
+> This is worth reporting upstream on the OHDSI/ETL-Synthea GitHub: an inner join plus a Condition-only domain filter drops whole death records, which contradicts the OMOP convention of keeping unmapped values with `concept_id = 0`. The diagnostic queries above and the lines quoted from `insert_death.sql` are a complete reproduction.
 
 ### 7c. Pin, record, back up
 
@@ -1605,7 +1631,7 @@ Networking: put both stacks on a shared Docker network, or point Broadsea at `ho
 | Nobody in the "both" cell | Guard `year` is later than the simulation end date | Line the Guard up with the run's end date (A-001) |
 | Port 5432 in use | Local Postgres already running | Set `OMOP_DB_PORT=5433` in `.env` |
 | Immunizations missing from `drug_exposure`, yet "0 unmapped" | CVX isn't in the vocabulary bundle, so the ETL drops immunizations instead of mapping them to `0` | Add **CVX** in Athena (Step 3b), reload, then rerun the 7a reconciliation queries |
-| `cdm.death` has fewer rows than deceased patients | `insert_death.sql` drops deaths with no death-cert encounter or an unmapped cause | Step 7b: diagnose, then run `patch_missing_deaths.sql` |
+| `cdm.death` has fewer rows than deceased patients | `insert_death.sql` inner-joins the cause and keeps only Condition-domain causes: it drops deaths with no death-cert encounter, an unmapped cause, or a cause mapping to another domain | Step 7b: diagnose, then run `patch_missing_deaths.sql` |
 | A concept has `Maps to value` but no `Maps to` | Its `Maps to` target is in a vocabulary you didn't download (e.g. Cancer Modifier) | Check the concept on athena.ohdsi.org; add that vocabulary to the bundle and reload |
 | Common Synthea codes map to `0` | Synthea uses some SNOMED codes **retired** after it was written (`invalid_reason = 'D'`) | Expected. List them with 7a query 4 and record each in `docs/assumptions.md`; any mapping is a terminology-review decision |
 | `LoadVocabFromCsv` warns "Found and resolved improper quoting … `"y set" tubing`" | One HCPCS concept name (`A4719`, concept 2614984) starts with a double quote; `fread` detects and heals it | Harmless. Confirm with `wc -l CONCEPT.csv` (minus header) = `SELECT COUNT(*) FROM cdm.concept` |
