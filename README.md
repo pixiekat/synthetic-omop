@@ -141,6 +141,8 @@ cd synthetic-omop
 git init   # local only; commit when you've reviewed things
 ```
 
+> Create the `data/` folders yourself, as above. If Docker creates a missing bind-mount folder, it makes it **owned by root**, and the pipeline containers (which run as your UID) then can't write to it.
+
 ### `.editorconfig`
 
 ```ini
@@ -198,6 +200,12 @@ OMOP_DB_USER=omop_admin
 OMOP_DB_PASSWORD=change-me-to-something-long
 # Bound to 127.0.0.1 in compose.yaml, so it isn't exposed to the network.
 OMOP_DB_PORT=5432
+
+# Your HOST user/group IDs. Run `id -u` and `id -g` and paste the numbers here.
+# The calibration, synthea and etl containers run as this user, so files they
+# write into ./data are owned by you and not by an unknown in-image user.
+LOCAL_UID=1000
+LOCAL_GID=1000
 
 # Synthea run parameters. Change RUN_ID for every run (see docs/run-log.md).
 RUN_ID=pilot-0001
@@ -283,6 +291,10 @@ services:
   calibration:
     profiles: ["calibrate"]
     build: ./services/calibration
+    # Run as YOUR host user so output in ./data/calibration is writable (and owned by you).
+    user: "${LOCAL_UID}:${LOCAL_GID}"
+    environment:
+      HOME: /tmp                                  # your UID has no home dir in the image
     volumes:
       - ./data/source/nsduh:/data/source:ro       # read-only input
       - ./data/calibration:/data/calibration      # output
@@ -298,7 +310,11 @@ services:
       context: ./services/synthea
       args:
         SYNTHEA_VERSION: v3.3.0
+    # Run as YOUR host user. Without this, the in-image "synthea" user (a different
+    # UID) can't write to ./data/synthea-output, and mkdir fails with "Permission denied".
+    user: "${LOCAL_UID}:${LOCAL_GID}"
     environment:
+      HOME: /tmp                                # Java wants a writable home; your UID has none in the image
       RUN_ID: ${RUN_ID}
       SYNTHEA_SEED: ${SYNTHEA_SEED}
       SYNTHEA_POPULATION: ${SYNTHEA_POPULATION}
@@ -319,7 +335,10 @@ services:
     depends_on:
       omop-db:
         condition: service_healthy
+    # Run as YOUR host user so DQD output in ./data/dqd is writable.
+    user: "${LOCAL_UID}:${LOCAL_GID}"
     environment:
+      HOME: /tmp
       DB_SERVER: omop-db/${OMOP_DB_NAME}      # DatabaseConnector "host/dbname" form
       DB_PORT: "5432"                         # internal port, not the host port
       DB_USER: ${OMOP_DB_USER}
@@ -389,9 +408,54 @@ Put all three in `data/source/nsduh/2024/`. Record the file names and download d
 ### 3b. Athena vocabularies
 
 1. Sign in at <https://athena.ohdsi.org/> → **Download**.
-2. Select at least **SNOMED, RxNorm, RxNorm Extension, LOINC, CVX, and Gender/Race/Ethnicity/Visit/Domain** (the defaults include most of these). Synthea also emits some CPT4 procedure codes. CPT4 needs your UMLS key and running `cpt.sh` after download, as Athena's instructions describe.
+2. Select at least **SNOMED, RxNorm, RxNorm Extension, LOINC, CVX, and Gender/Race/Ethnicity/Visit/Domain** (the defaults include most of these).
 3. Unzip into `data/vocab/athena/` so that `CONCEPT.csv` sits directly in that folder.
-4. Write the **vocabulary release version** into `docs/run-log.md`. It's in `VOCABULARY.csv` under the row `vocabulary_id = 'None'`.
+4. **Optional: merge CPT4** (see 3c) **before** moving files around and before the first ETL run.
+5. **Move the non-vocabulary files out** so the ETL loader only sees OMOP tables:
+   ```bash
+   mkdir -p data/vocab/athena-extras
+   cd data/vocab/athena
+   mv vocabulary_download_v5_*.zip cpt4.jar cpt.sh cpt.bat readme.txt \
+      CONCEPT_CPT4.csv CONCEPT_METADATA.csv CONCEPT_RELATIONSHIP_METADATA.csv \
+      ../athena-extras/
+   cd - >/dev/null
+   ls data/vocab/athena    # 10 CSVs: CONCEPT, CONCEPT_ANCESTOR, CONCEPT_CLASS, CONCEPT_RELATIONSHIP,
+                           # CONCEPT_SYNONYM, DOMAIN, DRUG_STRENGTH, PACK_CONTENT, RELATIONSHIP, VOCABULARY
+   ```
+6. Write the **vocabulary release version** into `docs/run-log.md`:
+   ```bash
+   grep -P '^None\t' data/vocab/athena/VOCABULARY.csv     # e.g. "v5.0 29-AUG-26"
+   ```
+7. Check disk space (`df -h .`). The loaded vocabulary takes roughly 2–3× the CSV size in the Docker volume.
+
+### 3c. Optional: CPT4
+
+CPT4 is AMA-licensed, so Athena ships `CONCEPT_CPT4.csv` plus `cpt4.jar`, which merges CPT4 into `CONCEPT.csv` using **your own UMLS API key** (<https://uts.nlm.nih.gov/> → My Profile). **For the pilot you can skip it.** Synthea codes most procedures in SNOMED, so without CPT4 only a handful of procedures end up with `procedure_concept_id = 0`.
+
+> ⚠ Merge **before** the first ETL vocabulary load. If you merge afterwards, you need `docker compose down -v` and a full ETL to reload the vocabulary.
+
+No Java on the host is needed, because this borrows the Synthea image's runtime:
+
+```bash
+# If you've already moved the helpers to athena-extras/, bring them back for the moment
+cp data/vocab/athena-extras/{cpt4.jar,CONCEPT_CPT4.csv} data/vocab/athena/ 2>/dev/null || true
+cp data/vocab/athena/CONCEPT.csv data/vocab/athena-extras/CONCEPT.pre-cpt4.csv   # backup
+
+read -rs "UMLS_KEY?UMLS API key: " 2>/dev/null || read -rsp "UMLS API key: " UMLS_KEY; echo   # zsh || bash
+
+docker run --rm \
+  --user "$(id -u):$(id -g)" -e HOME=/tmp \
+  -v "$PWD/data/vocab/athena:/vocab" -w /vocab \
+  --entrypoint java \
+  synthetic-omop-synthea \
+  -Dumls-apikey="$UMLS_KEY" -jar cpt4.jar 5           # same as Athena's cpt.sh
+
+unset UMLS_KEY
+grep -c $'\tCPT4\t' data/vocab/athena/CONCEPT.csv    # > 0 means it merged
+mv data/vocab/athena/{cpt4.jar,CONCEPT_CPT4.csv} data/vocab/athena-extras/
+```
+
+Record **"CPT4 merged: yes/no"** next to the vocabulary release in `run-log.md`. The same Athena release gives different procedure mappings with and without it.
 
 ---
 
@@ -663,16 +727,22 @@ The parent module:
 
 Build or edit this visually in the module builder (<https://synthetichealth.github.io/module-builder/>) and export the JSON. The structure is:
 
-### `services/synthea/modules/concurrent_disorders.json` (skeleton, abbreviated)
+### `services/synthea/modules/concurrent_disorders.json`
+
+> **Synthea JSON gotchas.** Every `remarks` field, at module **and** state level, must be an **array of strings**. A plain string fails with `Expected BEGIN_ARRAY but was STRING at path $.remarks`. Every state needs a `type`, and every transition must name a state that exists. Each stratum's `distributions` must sum to 1.
+
+> **The `0.25` values are uniform placeholders** for testing the plumbing. Replace them with the NSDUH estimates from `joint_probabilities.json` before any real run.
 
 ```json
 {
   "name": "Concurrent Disorders (NSDUH-calibrated)",
   "remarks": [
-    "Parent module: assigns ONE joint MHD/SUD profile per adult, drawn from",
-    "NSDUH 2024 weighted joint estimates by age x sex (data/calibration).",
-    "Diagnosis codes are SIMULATION ASSUMPTIONS. See docs/assumptions.md A-001..A-004.",
-    "Only one stratum is shown filled in; generate the rest from joint_probabilities.json."
+    "Parent module: assigns ONE joint MHD/SUD profile per adult.",
+    "Probabilities MUST come from data/calibration/joint_probabilities.json (NSDUH 2024, weighted, by age x sex).",
+    "The 0.25 values below are UNIFORM PLACEHOLDERS for plumbing tests only. They are NOT NSDUH estimates.",
+    "Only one stratum (F, 35-49) is shown; add one complex_transition entry per stratum.",
+    "Diagnosis codes are SIMULATION ASSUMPTIONS (docs/assumptions.md A-002, A-003) pending clinical review.",
+    "NOTE: in Synthea module JSON, every 'remarks' field must be an ARRAY of strings, never a plain string."
   ],
   "gmf_version": 2,
   "states": {
@@ -684,7 +754,10 @@ Build or edit this visually in the module builder (<https://synthetichealth.gith
 
     "Wait_Until_Adult_In_Window": {
       "type": "Guard",
-      "remarks": "A-001: onset placed inside the 24-month export window. Align 'year' with the simulation end date.",
+      "remarks": [
+        "A-001: onset placed inside the 24-month export window (exporter.years_of_history = 2).",
+        "Keep 'year' aligned with the simulation end date, or nobody ever passes this guard."
+      ],
       "allow": {
         "condition_type": "And",
         "conditions": [
@@ -697,7 +770,10 @@ Build or edit this visually in the module builder (<https://synthetichealth.gith
 
     "Assign_Profile": {
       "type": "Simple",
-      "remarks": "Joint draw. NEVER replace this with two independent draws.",
+      "remarks": [
+        "Joint draw: one of four profiles per person, per stratum.",
+        "NEVER replace this with two independent MHD / SUD draws."
+      ],
       "complex_transition": [
         {
           "condition": {
@@ -705,18 +781,17 @@ Build or edit this visually in the module builder (<https://synthetichealth.gith
             "conditions": [
               { "condition_type": "Gender", "gender": "F" },
               { "condition_type": "Age", "operator": ">=", "quantity": 35, "unit": "years" },
-              { "condition_type": "Age", "operator": "<",  "quantity": 50, "unit": "years" }
+              { "condition_type": "Age", "operator": "<", "quantity": 50, "unit": "years" }
             ]
           },
           "distributions": [
-            { "distribution": 0.0, "transition": "Set_Neither" },
-            { "distribution": 0.0, "transition": "Set_MHD_Only" },
-            { "distribution": 0.0, "transition": "Set_SUD_Only" },
-            { "distribution": 0.0, "transition": "Set_Both" }
+            { "distribution": 0.25, "transition": "Set_Neither" },
+            { "distribution": 0.25, "transition": "Set_MHD_Only" },
+            { "distribution": 0.25, "transition": "Set_SUD_Only" },
+            { "distribution": 0.25, "transition": "Set_Both" }
           ]
         },
         {
-          "remarks": "Fallback: should never fire if every stratum is listed above.",
           "distributions": [
             { "distribution": 1.0, "transition": "Set_Neither" }
           ]
@@ -724,32 +799,114 @@ Build or edit this visually in the module builder (<https://synthetichealth.gith
       ]
     },
 
-    "Set_Neither":  { "type": "SetAttribute", "attribute": "concurrent_profile", "value": "neither",  "direct_transition": "Terminal" },
-    "Set_MHD_Only": { "type": "SetAttribute", "attribute": "concurrent_profile", "value": "mhd_only", "direct_transition": "MHD_Encounter" },
-    "Set_SUD_Only": { "type": "SetAttribute", "attribute": "concurrent_profile", "value": "sud_only", "direct_transition": "SUD_Encounter" },
-    "Set_Both":     { "type": "SetAttribute", "attribute": "concurrent_profile", "value": "both",     "direct_transition": "Both_Encounter" },
+    "Set_Neither": {
+      "type": "SetAttribute",
+      "attribute": "concurrent_profile",
+      "value": "neither",
+      "direct_transition": "Terminal"
+    },
+    "Set_MHD_Only": {
+      "type": "SetAttribute",
+      "attribute": "concurrent_profile",
+      "value": "mhd_only",
+      "direct_transition": "MHD_Encounter"
+    },
+    "Set_SUD_Only": {
+      "type": "SetAttribute",
+      "attribute": "concurrent_profile",
+      "value": "sud_only",
+      "direct_transition": "SUD_Encounter"
+    },
+    "Set_Both": {
+      "type": "SetAttribute",
+      "attribute": "concurrent_profile",
+      "value": "both",
+      "direct_transition": "Both_Encounter"
+    },
 
     "MHD_Encounter": {
       "type": "Encounter",
       "encounter_class": "ambulatory",
-      "reason": null,
-      "codes": [{ "system": "SNOMED-CT", "code": "185345009", "display": "Encounter for symptom (procedure)" }],
+      "codes": [
+        { "system": "SNOMED-CT", "code": "185345009", "display": "Encounter for symptom (procedure)" }
+      ],
       "direct_transition": "MHD_Onset"
     },
     "MHD_Onset": {
       "type": "ConditionOnset",
-      "remarks": "A-002: survey 'any mental illness' → MDD. PLACEHOLDER, needs clinical review.",
+      "remarks": ["A-002: survey 'any mental illness' -> MDD. PLACEHOLDER, needs clinical review."],
       "target_encounter": "MHD_Encounter",
       "assign_to_attribute": "mhd_condition",
-      "codes": [{ "system": "SNOMED-CT", "code": "370143000", "display": "Major depressive disorder (disorder)" }],
+      "codes": [
+        { "system": "SNOMED-CT", "code": "370143000", "display": "Major depressive disorder (disorder)" }
+      ],
       "direct_transition": "End_MHD_Encounter"
     },
-    "End_MHD_Encounter": { "type": "EncounterEnd", "direct_transition": "Terminal" },
+    "End_MHD_Encounter": {
+      "type": "EncounterEnd",
+      "direct_transition": "Terminal"
+    },
 
-    "SUD_Encounter":     { "...": "same pattern as MHD_Encounter → SUD_Onset → EncounterEnd" },
-    "Both_Encounter":    { "...": "one encounter, TWO ConditionOnset states, so the episodes overlap by construction" },
+    "SUD_Encounter": {
+      "type": "Encounter",
+      "encounter_class": "ambulatory",
+      "codes": [
+        { "system": "SNOMED-CT", "code": "185345009", "display": "Encounter for symptom (procedure)" }
+      ],
+      "direct_transition": "SUD_Onset"
+    },
+    "SUD_Onset": {
+      "type": "ConditionOnset",
+      "remarks": ["A-003: survey 'substance use disorder' -> alcoholism. PLACEHOLDER, needs clinical review."],
+      "target_encounter": "SUD_Encounter",
+      "assign_to_attribute": "sud_condition",
+      "codes": [
+        { "system": "SNOMED-CT", "code": "7200002", "display": "Alcoholism (disorder)" }
+      ],
+      "direct_transition": "End_SUD_Encounter"
+    },
+    "End_SUD_Encounter": {
+      "type": "EncounterEnd",
+      "direct_transition": "Terminal"
+    },
 
-    "Terminal": { "type": "Terminal" }
+    "Both_Encounter": {
+      "type": "Encounter",
+      "remarks": ["One encounter, two diagnoses: the active periods overlap by construction."],
+      "encounter_class": "ambulatory",
+      "codes": [
+        { "system": "SNOMED-CT", "code": "185345009", "display": "Encounter for symptom (procedure)" }
+      ],
+      "direct_transition": "Both_MHD_Onset"
+    },
+    "Both_MHD_Onset": {
+      "type": "ConditionOnset",
+      "remarks": ["A-002 (see MHD_Onset)."],
+      "target_encounter": "Both_Encounter",
+      "assign_to_attribute": "mhd_condition",
+      "codes": [
+        { "system": "SNOMED-CT", "code": "370143000", "display": "Major depressive disorder (disorder)" }
+      ],
+      "direct_transition": "Both_SUD_Onset"
+    },
+    "Both_SUD_Onset": {
+      "type": "ConditionOnset",
+      "remarks": ["A-003 (see SUD_Onset)."],
+      "target_encounter": "Both_Encounter",
+      "assign_to_attribute": "sud_condition",
+      "codes": [
+        { "system": "SNOMED-CT", "code": "7200002", "display": "Alcoholism (disorder)" }
+      ],
+      "direct_transition": "End_Both_Encounter"
+    },
+    "End_Both_Encounter": {
+      "type": "EncounterEnd",
+      "direct_transition": "Terminal"
+    },
+
+    "Terminal": {
+      "type": "Terminal"
+    }
   }
 }
 ```
@@ -801,7 +958,11 @@ WORKDIR /synthea
 # Pull the release jar (bundled with dependencies) for a pinned version.
 # VERIFY the asset name on the release page; it has been
 # "synthea-with-dependencies.jar" for the 3.x line.
-ADD https://github.com/synthetichealth/synthea/releases/download/${SYNTHEA_VERSION}/synthea-with-dependencies.jar /synthea/synthea.jar
+#
+# --chmod=0644 is REQUIRED: remote ADD saves files as 600 root:root, and the
+# container runs as your host UID (compose `user:`), which couldn't read it
+# ("Unable to access jarfile"). --chmod needs BuildKit (default in modern Docker).
+ADD --chmod=0644 https://github.com/synthetichealth/synthea/releases/download/${SYNTHEA_VERSION}/synthea-with-dependencies.jar /synthea/synthea.jar
 
 COPY run.sh /synthea/run.sh
 RUN chmod 0755 /synthea/run.sh \
@@ -852,8 +1013,8 @@ if [[ -n "${KEEP_MODULE:-}" ]]; then
   ARGS+=( -k "${KEEP_MODULE}" )
 fi
 
-# Save the exact invocation for the run log.
-printf '%q ' java -jar /synthea/synthea.jar "${ARGS[@]}" "${SYNTHEA_STATE}" > "${OUT}/COMMAND.txt"
+# Save the exact invocation for the run log (the trailing echo adds a final newline).
+{ printf '%q ' java -jar /synthea/synthea.jar "${ARGS[@]}" "${SYNTHEA_STATE}"; echo; } > "${OUT}/COMMAND.txt"
 
 exec java -jar /synthea/synthea.jar "${ARGS[@]}" "${SYNTHEA_STATE}"
 ```
@@ -1161,6 +1322,10 @@ Networking: put both stacks on a shared Docker network, or point Broadsea at `ho
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `FATAL: role "root" does not exist` | `$OMOP_DB_USER` is empty in your host shell, because `.env` is only read by Compose | Use the `sh -c '… $POSTGRES_USER …'` form from Step 2, or `set -a; . ./.env; set +a` |
+| `mkdir: Permission denied` (synthea, calibration or etl) | The container's user UID ≠ the owner of the bind-mounted `./data/...` folder. `sudo docker …` doesn't help, because it doesn't change the user *inside* the container | Set `LOCAL_UID`/`LOCAL_GID` in `.env` (from `id -u` / `id -g`), then `sudo chown -R "$(id -u):$(id -g)" data` |
+| `Error: Unable to access jarfile /synthea/synthea.jar` | Remote `ADD` saved the jar as `600 root:root`, so the non-root container user can't read it | Use `ADD --chmod=0644 …` in the Synthea Dockerfile, then `docker compose --profile generate build --no-cache synthea` |
+| `Output … already exists. Choose a new RUN_ID.` | A previous (possibly failed) run left its folder | Delete `data/synthea-output/<RUN_ID>` or bump `RUN_ID` in `.env` |
+| Synthea: `Expected BEGIN_ARRAY but was STRING at path $.remarks` | A `remarks` field in your module is a string | Make every `remarks` (module and state level) an array: `"remarks": ["…"]` |
 | `initdb` schemas missing | Volume already existed, so init scripts were skipped | `docker compose down -v` (deletes data) and start again |
 | ETL: `Java heap space` | Large vocabulary load | Add `ENV _JAVA_OPTIONS=-Xmx4g` to the ETL Dockerfile |
 | ETL: column mismatch in `LoadSyntheaTables` | `synthea_version` in `run_etl.R` ≠ the jar that produced the CSVs | Make them match (3.3.0) |
