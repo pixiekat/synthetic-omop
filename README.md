@@ -26,7 +26,8 @@
 10. [Step 7: Load into OMOP with ETL-Synthea](#step-7-load-into-omop-with-etl-synthea)
     - [7a. Verify the load](#7a-verify-the-load)
     - [7b. Known ETL-Synthea gap: dropped deaths](#7b-known-etl-synthea-gap-dropped-deaths)
-    - [7c. Pin, record, back up](#7c-pin-record-back-up)
+    - [7c. Known ETL-Synthea gap: dropped immunizations](#7c-known-etl-synthea-gap-dropped-immunizations)
+    - [7d. Pin, record, back up](#7d-pin-record-back-up)
 11. [Step 8: Validate](#step-8-validate)
 12. [Step 9 (optional): Atlas via OHDSI Broadsea](#step-9-optional-atlas-via-ohdsi-broadsea)
 13. [QA checklist](#qa-checklist)
@@ -103,7 +104,7 @@ synthetic-omop/
 │   ├── 002_calibration.md
 │   └── 003_omop-concepts.md
 │
-├── backups/                       # ⚠ gitignored. pg_dump files of loaded databases (Step 7c)
+├── backups/                       # ⚠ gitignored. pg_dump files of loaded databases (Step 7d)
 │
 ├── data/                          # ⚠ gitignored. Large, licensed, or generated.
 │   ├── source/
@@ -138,8 +139,9 @@ synthetic-omop/
         ├── Dockerfile
         ├── run_etl.R              # ETL-Synthea call sequence, step toggles
         └── sql/
-            ├── validate_joint.sql        # Compares OMOP joint counts to targets
-            └── patch_missing_deaths.sql  # Restores deaths the standard ETL drops (Step 7b)
+            ├── validate_joint.sql               # Compares OMOP joint counts to targets
+            ├── patch_missing_deaths.sql         # Restores deaths the standard ETL drops (Step 7b)
+            └── patch_missing_immunizations.sql  # Restores immunizations the standard ETL drops (Step 7c)
 ```
 
 ---
@@ -427,7 +429,7 @@ Put all three in `data/source/nsduh/2024/`. Record the file names and download d
 1. Sign in at <https://athena.ohdsi.org/> → **Download**.
 2. Start from Athena's **defaults** and **add CVX and Cancer Modifier**. Neither is a default, and Synthea needs both. Core vocabularies like UCUM, Visit, Domain and the Type concepts come with every bundle automatically.
 
-   > ⚠ **Don't skip CVX.** Synthea codes every **immunization** in CVX. Without it, ETL-Synthea **drops** immunization records rather than mapping them to `0`, so they never reach `drug_exposure`, and the unmapped count stays at zero, which hides the loss. In the pilot (no CVX), `drug_exposure` held exactly the 28,265 medications and no immunizations. Reloading with CVX brought back **2,685 of 2,711**. The remaining 26 are under investigation (see Step 7a); they're likely a domain filter or retired CVX codes, the same pattern as the deaths.
+   > ⚠ **Don't skip CVX.** Synthea codes every **immunization** in CVX. Without it, ETL-Synthea **drops** immunization records rather than mapping them to `0`, so they never reach `drug_exposure`, and the unmapped count stays at zero, which hides the loss. In the pilot (no CVX), `drug_exposure` held exactly the 28,265 medications and no immunizations. Reloading with CVX brought back **2,685 of 2,711**. The remaining 26 fail two hard-coded ETL filters and are restored by a patch (Step 7c).
 
    > ⚠ **Don't skip Cancer Modifier.** OMOP maps SNOMED *metastasis* concepts (e.g. `94260004` "Metastatic malignant neoplasm to colon") to **Cancer Modifier**, and Synthea's cancer modules produce them. Without it, Athena leaves the `Maps to` row out of `CONCEPT_RELATIONSHIP.csv` and keeps only the `Maps to value → Positive` half, so those records map to `0`. Without it, those concepts can't map at all. (Deaths with these causes *also* need the Step 7b patch, because `insert_death.sql` only accepts Condition-domain causes, and Cancer Modifier concepts are Measurements.) **General rule:** if a concept has `Maps to value` but no `Maps to`, check its page on Athena; the missing target is usually in a vocabulary you didn't select.
 3. Unzip into `data/vocab/athena/` so that `CONCEPT.csv` sits directly in that folder.
@@ -954,6 +956,7 @@ Every simulation choice and every deviation from the standard ETL gets an ID, so
 | A-005 | Deaths dropped by ETL-Synthea are restored with `cause_concept_id = 0` | `services/etl/sql/patch_missing_deaths.sql` | Applied after every ETL |
 | A-006 | SNOMED `55680006` "Drug overdose" was retired in 2021 and has no `Maps to`; candidates 607147 "Overdose" / 4053782 "Overdose of opiate" | `cdm.death`, `cdm.condition_occurrence` | Unmapped (`0`) pending terminology review |
 | A-007 | SNOMED `94260004` maps to Cancer Modifier 35226112 (Measurement domain), which needs the Cancer Modifier vocabulary | Athena bundle (Step 3b); `cdm.death` via patch | Mapping resolved by adding Cancer Modifier; deaths still restored by the patch (ETL accepts Condition-domain causes only) |
+| A-008 | Immunizations dropped by ETL-Synthea (single-digit CVX codes `3`/`8` vs `03`/`08`; COVID `207`/`208` mapping outside CVX) are restored, with unmappable codes kept as `0` | `services/etl/sql/patch_missing_immunizations.sql` | Applied after every ETL |
 ```
 
 ### `services/synthea/keep/keep_concurrent.json` (optional)
@@ -1465,7 +1468,36 @@ Afterwards, `cdm.death` should match `deceased_in_synthea` from 7a. In the pilot
 
 > This is worth reporting upstream on the OHDSI/ETL-Synthea GitHub: an inner join plus a Condition-only domain filter drops whole death records, which contradicts the OMOP convention of keeping unmapped values with `concept_id = 0`. The diagnostic queries above and the lines quoted from `insert_death.sql` are a complete reproduction.
 
-### 7c. Pin, record, back up
+### 7c. Known ETL-Synthea gap: dropped immunizations
+
+With CVX loaded, **2,685 of 2,711** pilot immunizations reached `drug_exposure`. The per-code query in 7a showed the missing **26** came from four codes, with two separate causes, both confirmed in the package SQL (`cdm_version/v540/insert_drug_exposure.sql`):
+
+| Codes | Records | Cause |
+|---|---|---|
+| `3` (MMR), `8` (Hep B pediatric) | 8 | **Leading zeros.** Synthea writes `3`; CVX writes `03`. Codes are text, so `'3' ≠ '03'` and the inner join (`source_vocabulary_id = 'CVX'`, line 132) finds nothing |
+| `207`, `208` (COVID-19 mRNA) | 18 | **Vocabulary filter.** Line 127 requires `target_vocabulary_id = 'CVX'`, but these codes are non-standard in current releases and `Maps to` concepts in another vocabulary |
+
+It's the same family of bug as 7b: a hard-coded filter that assumes what the standard concept looks like (Condition domain there, CVX vocabulary here) breaks when the vocabulary changes.
+
+> Note how the CVX restriction protects the lookup: in ETL-Synthea's map, `source_code = '3'` also exists in Race ("Black or African American"), SOPT, UB04 and others. Codes are only unique **within** a vocabulary (Lesson 003).
+
+**Fix: `services/etl/sql/patch_missing_immunizations.sql`.** Run it after every ETL. It:
+
+- pads single-digit codes **only for the lookup**, so `drug_source_value` keeps Synthea's original `3` and staging is never modified;
+- uses a standard CVX concept as-is, **or** follows `Maps to` to any valid, standard, Drug-domain concept, in any vocabulary;
+- keeps anything still unmappable with `drug_concept_id = 0`, never dropping it;
+- copies `drug_type_concept_id` from the immunizations the ETL did load, links each row to its visit through the Synthea encounter where one exists, and is safe to rerun.
+
+```bash
+docker compose exec -T omop-db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"' \
+  < services/etl/sql/patch_missing_immunizations.sql
+```
+
+It prints a summary of the rows it's responsible for. In the pilot, expect `INSERT 0 26`, then rerun the 7a per-code query: it should return **no rows**.
+
+> Tested before first use against a mock CDM 5.4 `drug_exposure` (all NOT NULL constraints), covering padded codes, the Race-code collision, cross-vocabulary `Maps to`, an unmappable code, a missing visit, and a second run (inserts nothing). The test caught one bug: Postgres `LPAD('207', 2, '0')` **truncates** to `'20'`, so the patch pads with an explicit single-digit check instead.
+
+### 7d. Pin, record, back up
 
 Once an ETL run succeeds:
 
@@ -1598,7 +1630,7 @@ Networking: put both stacks on a shared Docker network, or point Broadsea at `ho
 - [ ] `run-log.md` row complete: versions, seed, hashes, vocab release
 - [ ] Athena bundle includes **CVX** and **Cancer Modifier** (`cut -f1 data/vocab/athena/VOCABULARY.csv | sort`); only the 10 vocabulary CSVs are in `data/vocab/athena/`
 - [ ] ETL finished without errors; `cdm.cdm_source` row describes the run
-- [ ] Step 7a counts reconcile (`person` = patients, `death` = deceased after the 7b patch)
+- [ ] Step 7a counts reconcile (`person` = patients, `death` = deceased after the 7b patch, per-code immunizations query empty after the 7c patch)
 - [ ] Unmapped-codes worklist (7a query 4) reviewed; new retired codes added to `docs/assumptions.md`
 - [ ] ETL-Synthea commit SHA pinned and recorded; database backed up to `backups/`
 - [ ] DQD failure rate reviewed; known failures documented
@@ -1631,6 +1663,7 @@ Networking: put both stacks on a shared Docker network, or point Broadsea at `ho
 | Nobody in the "both" cell | Guard `year` is later than the simulation end date | Line the Guard up with the run's end date (A-001) |
 | Port 5432 in use | Local Postgres already running | Set `OMOP_DB_PORT=5433` in `.env` |
 | Immunizations missing from `drug_exposure`, yet "0 unmapped" | CVX isn't in the vocabulary bundle, so the ETL drops immunizations instead of mapping them to `0` | Add **CVX** in Athena (Step 3b), reload, then rerun the 7a reconciliation queries |
+| A few immunization codes still missing *with* CVX loaded | Single-digit codes (`3` vs `03`) or codes that map outside CVX (e.g. COVID `207`/`208`) | Step 7c: run `patch_missing_immunizations.sql` |
 | `cdm.death` has fewer rows than deceased patients | `insert_death.sql` inner-joins the cause and keeps only Condition-domain causes: it drops deaths with no death-cert encounter, an unmapped cause, or a cause mapping to another domain | Step 7b: diagnose, then run `patch_missing_deaths.sql` |
 | A concept has `Maps to value` but no `Maps to` | Its `Maps to` target is in a vocabulary you didn't download (e.g. Cancer Modifier) | Check the concept on athena.ohdsi.org; add that vocabulary to the bundle and reload |
 | Common Synthea codes map to `0` | Synthea uses some SNOMED codes **retired** after it was written (`invalid_reason = 'D'`) | Expected. List them with 7a query 4 and record each in `docs/assumptions.md`; any mapping is a terminology-review decision |
