@@ -1,6 +1,12 @@
 # Secrets
 .env
 
+# Everything under backups/ is not needed for the project to run. Keep the folder structure with .gitkeep files.
+backups/**
+!backups/**/
+!backups/**/.gitkeep
+*.dump
+
 # Everything under data/ is large, licensed (Athena, NSDUH terms) or generated.
 # Keep the folder structure with .gitkeep files.
 data/**
