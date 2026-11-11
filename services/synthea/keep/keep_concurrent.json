@@ -1,0 +1,18 @@
+{
+  "name": "Keep: concurrent disorders only",
+  "gmf_version": 2,
+  "states": {
+    "Initial": {
+      "type": "Initial",
+      "conditional_transition": [
+        {
+          "condition": { "condition_type": "Attribute", "attribute": "concurrent_profile", "operator": "==", "value": "both" },
+          "transition": "Keep"
+        },
+        { "transition": "Terminal" }
+      ]
+    },
+    "Keep": { "type": "Terminal" },
+    "Terminal": { "type": "Terminal" }
+  }
+}

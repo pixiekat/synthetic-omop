@@ -1,0 +1,3 @@
+pandas==2.2.*
+numpy==2.*
+pyreadstat==1.2.*   # Only needed if you read the SAS/SPSS/Stata versions

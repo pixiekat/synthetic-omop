@@ -1,0 +1,31 @@
+{
+  "_comment": "Map NSDUH variables to our definitions. VERIFY every name in the 2024 codebook.",
+  "input_file": "/data/source/2024/NSDUH_2024_Tab.txt",
+  "input_format": "tsv",
+  "output_file": "/data/calibration/joint_probabilities.json",
+
+  "weight_var": "ANALWT2_C",
+  "age_var": "CATAG6",
+  "sex_var": "IRSEX",
+
+  "adult_filter": { "var": "CATAG6", "exclude_values": [1] },
+
+  "mhd": {
+    "var": "AMIYR_U",
+    "present_values": [1],
+    "absent_values": [0],
+    "definition": "Any mental illness, past year (survey-defined; NOT a clinical diagnosis)"
+  },
+  "sud": {
+    "var": "SUD_PLACEHOLDER",
+    "present_values": [1],
+    "absent_values": [0],
+    "definition": "Past-year substance use disorder per DSM-5 survey criteria"
+  },
+
+  "age_groups": { "2": "18-25", "3": "26-34", "4": "35-49", "5": "50-64", "6": "65+" },
+  "sex_labels": { "1": "M", "2": "F" },
+
+  "min_unweighted_n": 50,
+  "collapse_order": ["sex", "age"]
+}

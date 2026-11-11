@@ -1,0 +1,175 @@
+{
+  "name": "Concurrent Disorders (NSDUH-calibrated)",
+  "remarks": [
+    "Parent module: assigns ONE joint MHD/SUD profile per adult.",
+    "Probabilities MUST come from data/calibration/joint_probabilities.json (NSDUH 2024, weighted, by age x sex).",
+    "The 0.25 values below are UNIFORM PLACEHOLDERS for plumbing tests only. They are NOT NSDUH estimates.",
+    "Only one stratum (F, 35-49) is shown; add one complex_transition entry per stratum.",
+    "Diagnosis codes are SIMULATION ASSUMPTIONS (docs/assumptions.md A-002, A-003) pending clinical review.",
+    "NOTE: in Synthea module JSON, every 'remarks' field must be an ARRAY of strings, never a plain string."
+  ],
+  "gmf_version": 2,
+  "states": {
+
+    "Initial": {
+      "type": "Initial",
+      "direct_transition": "Wait_Until_Adult_In_Window"
+    },
+
+    "Wait_Until_Adult_In_Window": {
+      "type": "Guard",
+      "remarks": [
+        "A-001: onset placed inside the 24-month export window (exporter.years_of_history = 2).",
+        "Keep 'year' aligned with the simulation end date, or nobody ever passes this guard."
+      ],
+      "allow": {
+        "condition_type": "And",
+        "conditions": [
+          { "condition_type": "Age", "operator": ">=", "quantity": 18, "unit": "years" },
+          { "condition_type": "Date", "operator": ">=", "year": 2025 }
+        ]
+      },
+      "direct_transition": "Assign_Profile"
+    },
+
+    "Assign_Profile": {
+      "type": "Simple",
+      "remarks": [
+        "Joint draw: one of four profiles per person, per stratum.",
+        "NEVER replace this with two independent MHD / SUD draws."
+      ],
+      "complex_transition": [
+        {
+          "condition": {
+            "condition_type": "And",
+            "conditions": [
+              { "condition_type": "Gender", "gender": "F" },
+              { "condition_type": "Age", "operator": ">=", "quantity": 35, "unit": "years" },
+              { "condition_type": "Age", "operator": "<", "quantity": 50, "unit": "years" }
+            ]
+          },
+          "distributions": [
+            { "distribution": 0.25, "transition": "Set_Neither" },
+            { "distribution": 0.25, "transition": "Set_MHD_Only" },
+            { "distribution": 0.25, "transition": "Set_SUD_Only" },
+            { "distribution": 0.25, "transition": "Set_Both" }
+          ]
+        },
+        {
+          "distributions": [
+            { "distribution": 1.0, "transition": "Set_Neither" }
+          ]
+        }
+      ]
+    },
+
+    "Set_Neither": {
+      "type": "SetAttribute",
+      "attribute": "concurrent_profile",
+      "value": "neither",
+      "direct_transition": "Terminal"
+    },
+    "Set_MHD_Only": {
+      "type": "SetAttribute",
+      "attribute": "concurrent_profile",
+      "value": "mhd_only",
+      "direct_transition": "MHD_Encounter"
+    },
+    "Set_SUD_Only": {
+      "type": "SetAttribute",
+      "attribute": "concurrent_profile",
+      "value": "sud_only",
+      "direct_transition": "SUD_Encounter"
+    },
+    "Set_Both": {
+      "type": "SetAttribute",
+      "attribute": "concurrent_profile",
+      "value": "both",
+      "direct_transition": "Both_Encounter"
+    },
+
+    "MHD_Encounter": {
+      "type": "Encounter",
+      "encounter_class": "ambulatory",
+      "codes": [
+        { "system": "SNOMED-CT", "code": "185345009", "display": "Encounter for symptom (procedure)" }
+      ],
+      "direct_transition": "MHD_Onset"
+    },
+    "MHD_Onset": {
+      "type": "ConditionOnset",
+      "remarks": ["A-002: survey 'any mental illness' -> MDD. PLACEHOLDER, needs clinical review."],
+      "target_encounter": "MHD_Encounter",
+      "assign_to_attribute": "mhd_condition",
+      "codes": [
+        { "system": "SNOMED-CT", "code": "370143000", "display": "Major depressive disorder (disorder)" }
+      ],
+      "direct_transition": "End_MHD_Encounter"
+    },
+    "End_MHD_Encounter": {
+      "type": "EncounterEnd",
+      "direct_transition": "Terminal"
+    },
+
+    "SUD_Encounter": {
+      "type": "Encounter",
+      "encounter_class": "ambulatory",
+      "codes": [
+        { "system": "SNOMED-CT", "code": "185345009", "display": "Encounter for symptom (procedure)" }
+      ],
+      "direct_transition": "SUD_Onset"
+    },
+    "SUD_Onset": {
+      "type": "ConditionOnset",
+      "remarks": ["A-003: survey 'substance use disorder' -> alcoholism. PLACEHOLDER, needs clinical review."],
+      "target_encounter": "SUD_Encounter",
+      "assign_to_attribute": "sud_condition",
+      "codes": [
+        { "system": "SNOMED-CT", "code": "7200002", "display": "Alcoholism (disorder)" }
+      ],
+      "direct_transition": "End_SUD_Encounter"
+    },
+    "End_SUD_Encounter": {
+      "type": "EncounterEnd",
+      "direct_transition": "Terminal"
+    },
+
+    "Both_Encounter": {
+      "type": "Encounter",
+      "remarks": ["One encounter, two diagnoses: the active periods overlap by construction."],
+      "encounter_class": "ambulatory",
+      "codes": [
+        { "system": "SNOMED-CT", "code": "185345009", "display": "Encounter for symptom (procedure)" }
+      ],
+      "direct_transition": "Both_MHD_Onset"
+    },
+    "Both_MHD_Onset": {
+      "type": "ConditionOnset",
+      "remarks": ["A-002 (see MHD_Onset)."],
+      "target_encounter": "Both_Encounter",
+      "assign_to_attribute": "mhd_condition",
+      "codes": [
+        { "system": "SNOMED-CT", "code": "370143000", "display": "Major depressive disorder (disorder)" }
+      ],
+      "direct_transition": "Both_SUD_Onset"
+    },
+    "Both_SUD_Onset": {
+      "type": "ConditionOnset",
+      "remarks": ["A-003 (see SUD_Onset)."],
+      "target_encounter": "Both_Encounter",
+      "assign_to_attribute": "sud_condition",
+      "codes": [
+        { "system": "SNOMED-CT", "code": "7200002", "display": "Alcoholism (disorder)" }
+      ],
+      "direct_transition": "End_Both_Encounter"
+    },
+    "End_Both_Encounter": {
+      "type": "EncounterEnd",
+      "direct_transition": "Terminal"
+    },
+
+    "Terminal": {
+      "type": "Terminal"
+    }
+  }
+}

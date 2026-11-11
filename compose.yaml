@@ -1,0 +1,117 @@
+# =============================================================================
+# Synthetic concurrent-disorders → OMOP CDM 5.4, local stack
+#
+# Profiles (run one step at a time):
+#   (none)      → omop-db only
+#   calibrate   → estimate joint disorder probabilities from NSDUH (Step 4)
+#   generate    → run Synthea with our module (Step 6)
+#   etl         → load Synthea CSV + Athena vocab into OMOP (Step 7)
+#
+# Usage:
+#   docker compose up -d                                   # database
+#   docker compose --profile calibrate run --rm calibration
+#   docker compose --profile generate  run --rm synthea
+#   docker compose --profile etl       run --rm etl
+# =============================================================================
+name: synthetic-omop
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # omop-db: PostgreSQL target for OMOP CDM 5.4
+  # Schemas (from initdb/01_schemas.sql):
+  #   synthea → raw Synthea staging tables
+  #   cdm     → OMOP CDM + vocabulary tables
+  #   results → analysis output (Achilles / Atlas / our validation)
+  # ---------------------------------------------------------------------------
+  omop-db:
+    image: postgres:16
+    container_name: omop-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${OMOP_DB_NAME}
+      POSTGRES_USER: ${OMOP_DB_USER}
+      POSTGRES_PASSWORD: ${OMOP_DB_PASSWORD}
+    ports:
+      # Localhost only. Remove "127.0.0.1:" ONLY if you know you need LAN access.
+      - "127.0.0.1:${OMOP_DB_PORT:-5432}:5432"
+    volumes:
+      - omop-pgdata:/var/lib/postgresql/data
+      # Scripts here run once, the first time the volume is created.
+      - ./services/postgres/initdb:/docker-entrypoint-initdb.d:ro
+    # Vocabulary loads are write-heavy. These settings suit a laptop
+    # (local dev) and should NOT be copied to production.
+    command: >
+      postgres
+        -c shared_buffers=1GB
+        -c maintenance_work_mem=1GB
+        -c max_wal_size=4GB
+        -c synchronous_commit=off
+    shm_size: 1gb
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${OMOP_DB_USER} -d ${OMOP_DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ---------------------------------------------------------------------------
+  # calibration: Python, reads NSDUH and writes joint probabilities per stratum
+  # ---------------------------------------------------------------------------
+  calibration:
+    profiles: ["calibrate"]
+    build: ./services/calibration
+    volumes:
+      - ./data/source/nsduh:/data/source:ro       # read-only input
+      - ./data/calibration:/data/calibration      # output
+      - ./services/calibration:/app:ro            # code + config
+    command: ["python", "-I", "/app/estimate_joint.py", "--config", "/app/config.json"]
+
+  # ---------------------------------------------------------------------------
+  # synthea: Java, generates the population from our parent module
+  # ---------------------------------------------------------------------------
+  synthea:
+    profiles: ["generate"]
+    build:
+      context: ./services/synthea
+      args:
+        SYNTHEA_VERSION: v3.3.0
+    user: "${LOCAL_UID}:${LOCAL_GID}"
+    environment:
+      HOME: /tmp
+      RUN_ID: ${RUN_ID}
+      SYNTHEA_SEED: ${SYNTHEA_SEED}
+      SYNTHEA_POPULATION: ${SYNTHEA_POPULATION}
+      SYNTHEA_AGE_RANGE: ${SYNTHEA_AGE_RANGE}
+      SYNTHEA_STATE: ${SYNTHEA_STATE}
+    volumes:
+      - ./services/synthea/config:/synthea/config:ro
+      - ./services/synthea/modules:/synthea/modules:ro
+      - ./services/synthea/keep:/synthea/keep:ro
+      - ./data/synthea-output:/output
+
+  # ---------------------------------------------------------------------------
+  # etl: R with OHDSI ETLSyntheaBuilder (+ optional DataQualityDashboard)
+  # ---------------------------------------------------------------------------
+  etl:
+    profiles: ["etl"]
+    build: ./services/etl
+    depends_on:
+      omop-db:
+        condition: service_healthy
+    environment:
+      DB_SERVER: omop-db/${OMOP_DB_NAME}      # DatabaseConnector "host/dbname" form
+      DB_PORT: "5432"                         # internal port, not the host port
+      DB_USER: ${OMOP_DB_USER}
+      DB_PASSWORD: ${OMOP_DB_PASSWORD}
+      RUN_ID: ${RUN_ID}
+      ETL_CREATE_CDM: ${ETL_CREATE_CDM}
+      ETL_LOAD_VOCAB: ${ETL_LOAD_VOCAB}
+      ETL_RUN_DQD: ${ETL_RUN_DQD}
+    volumes:
+      - ./data/synthea-output:/data/synthea-output:ro
+      - ./data/vocab/athena:/data/vocab:ro
+      - ./data/dqd:/data/dqd
+      - ./services/etl:/app:ro
+
+volumes:
+  omop-pgdata:
