@@ -1349,6 +1349,8 @@ Networking: put both stacks on a shared Docker network, or point Broadsea at `ho
 
 ## Further learning
 
+Lessons and lectures can be found since the `lessions/` folder, complete with lab work, lectures, and homework to learn more.
+
 - **The Book of OHDSI.** Free, and the clearest explanation of the CDM, vocabularies and ETL: <https://ohdsi.github.io/TheBookOfOhdsi/>
 - **EHDEN Academy.** Free OMOP/ETL courses: <https://academy.ehden.eu/>
 - **Synthea wiki.** Start with the Generic Module Framework pages: <https://github.com/synthetichealth/synthea/wiki>
