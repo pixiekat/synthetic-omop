@@ -100,7 +100,8 @@ synthetic-omop/
 │
 ├── lessons/                       # Teaching material: lectures, labs, self-check questions
 │   ├── 001_pipeline-from-the-inside.md
-│   └── 002_calibration.md
+│   ├── 002_calibration.md
+│   └── 003_omop-concepts.md
 │
 ├── backups/                       # ⚠ gitignored. pg_dump files of loaded databases (Step 7c)
 │
@@ -1607,6 +1608,8 @@ Networking: put both stacks on a shared Docker network, or point Broadsea at `ho
 | `cdm.death` has fewer rows than deceased patients | `insert_death.sql` drops deaths with no death-cert encounter or an unmapped cause | Step 7b: diagnose, then run `patch_missing_deaths.sql` |
 | A concept has `Maps to value` but no `Maps to` | Its `Maps to` target is in a vocabulary you didn't download (e.g. Cancer Modifier) | Check the concept on athena.ohdsi.org; add that vocabulary to the bundle and reload |
 | Common Synthea codes map to `0` | Synthea uses some SNOMED codes **retired** after it was written (`invalid_reason = 'D'`) | Expected. List them with 7a query 4 and record each in `docs/assumptions.md`; any mapping is a terminology-review decision |
+| `LoadVocabFromCsv` warns "Found and resolved improper quoting … `"y set" tubing`" | One HCPCS concept name (`A4719`, concept 2614984) starts with a double quote; `fread` detects and heals it | Harmless. Confirm with `wc -l CONCEPT.csv` (minus header) = `SELECT COUNT(*) FROM cdm.concept` |
+| `LoadVocabFromCsv` warns "`type_convert()` only converts columns of type 'character'" | A small table with no text columns | Harmless; ignore |
 | `LoadVocabFromCsv` errors on unexpected files | Zip, jar, `CONCEPT_CPT4.csv` or `*_METADATA.csv` left in `data/vocab/athena/` | Move them to `athena-extras/` (Step 3b) |
 
 ---
@@ -1630,7 +1633,7 @@ Lessons and lectures can be found in the [`lessons/`](lessons/) folder, complete
 |---|---|
 | [001: The Pipeline from the Inside](lessons/001_pipeline-from-the-inside.md) | Containers, Compose networking, volumes, schemas, ETL, OMOP vocabularies |
 | [002: Calibration](lessons/002_calibration.md) | Survey weights, joint vs marginal probability, strata, sparse cells, sampling noise |
-| [003: OMOP Concepts, the Vocabulary Behind Every Row](lessons/003_omop-concepts.md) | OMOP Fundamentals |
+| [003: OMOP Concepts](lessons/003_omop-concepts.md) | Concepts, standard vs non-standard, domains, `Maps to`, hierarchies, deprecation, `concept_id = 0` |
 
 Further reading:
 
