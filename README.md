@@ -4,10 +4,11 @@
 
 | | |
 |---|---|
-| **Status** | Draft framework. The stack has not been run end to end yet, so expect to adjust things. |
+| **Status** | **Pilot run end to end** (`pilot-0001`, 2026-11-11): Synthea → ETL-Synthea → OMOP 5.4 loaded and checked. Calibration still uses **placeholder** probabilities; real NSDUH estimates are the next milestone. |
 | **Audience** | Engineers who build the pipeline (admin) and analysts who use the resulting database (non-admin) |
-| **Pinned versions** | Synthea `v3.3.0`, OMOP CDM `5.4`, ETL-Synthea (`OHDSI/ETL-Synthea`, pinned to a commit), PostgreSQL `16` |
+| **Pinned versions** | Synthea `v3.3.0`, OMOP CDM `5.4`, ETL-Synthea (`OHDSI/ETL-Synthea`, pinned to a commit), PostgreSQL `16`, Athena vocabulary `v5.0 29-AUG-26` |
 | **Source notes** | Builds on the OMOP project's planning notes. The method is unchanged; this guide adds the local Docker setup. |
+| **Lessons** | Teaching material for this pipeline lives in [`lessons/`](lessons/) (see [Further learning](#further-learning)). |
 
 ---
 
@@ -23,6 +24,9 @@
 8. [Step 5: Build the Synthea parent module](#step-5-build-the-synthea-parent-module)
 9. [Step 6: Generate the synthetic population](#step-6-generate-the-synthetic-population)
 10. [Step 7: Load into OMOP with ETL-Synthea](#step-7-load-into-omop-with-etl-synthea)
+    - [7a. Verify the load](#7a-verify-the-load)
+    - [7b. Known ETL-Synthea gap: dropped deaths](#7b-known-etl-synthea-gap-dropped-deaths)
+    - [7c. Pin, record, back up](#7c-pin-record-back-up)
 11. [Step 8: Validate](#step-8-validate)
 12. [Step 9 (optional): Atlas via OHDSI Broadsea](#step-9-optional-atlas-via-ohdsi-broadsea)
 13. [QA checklist](#qa-checklist)
@@ -88,17 +92,24 @@ synthetic-omop/
 ├── .env.example                   # Copy to .env; never commit .env
 ├── .gitignore                     # Keeps data/ and secrets out of git
 ├── compose.yaml                   # The whole stack, organised by profiles
-├── README.md                      # Short version of this guide
+├── README.md                      # This guide
 │
 ├── docs/
 │   ├── assumptions.md             # Every simulation assumption, numbered (A-001 …)
 │   └── run-log.md                 # One row per generation run (provenance)
 │
+├── lessons/                       # Teaching material: lectures, labs, self-check questions
+│   ├── 001_pipeline-from-the-inside.md
+│   └── 002_calibration.md
+│
+├── backups/                       # ⚠ gitignored. pg_dump files of loaded databases (Step 7c)
+│
 ├── data/                          # ⚠ gitignored. Large, licensed, or generated.
 │   ├── source/
 │   │   └── nsduh/2024/            # NSDUH PUF + codebook + Data Users' Guide
 │   ├── vocab/
-│   │   └── athena/                # Unzipped Athena bundle (CONCEPT.csv etc.)
+│   │   ├── athena/                # The 10 OMOP vocabulary CSVs ONLY (the ETL reads this folder)
+│   │   └── athena-extras/         # Original zip, CPT4 tool, *_METADATA files (kept out of the ETL's way)
 │   ├── calibration/               # Output of Step 4 (joint_probabilities.json)
 │   ├── synthea-output/
 │   │   └── <run-id>/csv/          # One folder per Synthea run
@@ -126,7 +137,8 @@ synthetic-omop/
         ├── Dockerfile
         ├── run_etl.R              # ETL-Synthea call sequence, step toggles
         └── sql/
-            └── validate_joint.sql # Compares OMOP joint counts to targets
+            ├── validate_joint.sql        # Compares OMOP joint counts to targets
+            └── patch_missing_deaths.sql  # Restores deaths the standard ETL drops (Step 7b)
 ```
 
 ---
@@ -179,6 +191,10 @@ indent_size = 4
 data/**
 !data/**/
 !data/**/.gitkeep
+
+# Database dumps: large, and they contain the full licensed vocabulary
+backups/
+*.dump
 
 # R / Python cruft
 .Rhistory
@@ -408,7 +424,9 @@ Put all three in `data/source/nsduh/2024/`. Record the file names and download d
 ### 3b. Athena vocabularies
 
 1. Sign in at <https://athena.ohdsi.org/> → **Download**.
-2. Select at least **SNOMED, RxNorm, RxNorm Extension, LOINC, CVX, and Gender/Race/Ethnicity/Visit/Domain** (the defaults include most of these).
+2. Select at least **SNOMED, RxNorm, RxNorm Extension, LOINC, CVX, Cancer Modifier, and Gender/Race/Ethnicity/Visit/Domain** (the defaults include most of these).
+
+   > ⚠ **Don't skip Cancer Modifier.** OMOP maps SNOMED *metastasis* concepts (e.g. `94260004` "Metastatic malignant neoplasm to colon") to **Cancer Modifier**, and Synthea's cancer modules produce them. Without it, Athena leaves the `Maps to` row out of `CONCEPT_RELATIONSHIP.csv` and keeps only the `Maps to value → Positive` half, so those records map to `0`. In the pilot this silently dropped 3 deaths (Step 7b). **General rule:** if a concept has `Maps to value` but no `Maps to`, check its page on Athena; the missing target is usually in a vocabulary you didn't select.
 3. Unzip into `data/vocab/athena/` so that `CONCEPT.csv` sits directly in that folder.
 4. **Optional: merge CPT4** (see 3c) **before** moving files around and before the first ETL run.
 5. **Move the non-vocabulary files out** so the ETL loader only sees OMOP tables:
@@ -915,7 +933,25 @@ Build or edit this visually in the module builder (<https://synthetichealth.gith
 
 1. All strata from `joint_probabilities.json`. A 30-line script that renders the `complex_transition` array from the JSON is worth writing, so nobody ever hand-copies probabilities.
 2. Follow-up visits and treatment (`MedicationOrder`, `CarePlanStart`), each tagged with an assumption ID.
-3. **Prevent duplicates.** Synthea's built-in modules (e.g. `opioid_addiction`, `alcohol`, `depression` screening) can generate overlapping conditions. Either disable them with `-m` module filtering in `run.sh`, or check for them in validation (Step 8).
+3. **Prevent duplicates.** Synthea's built-in modules (e.g. `opioid_addiction`, `alcohol`, `depression` screening) can generate overlapping conditions. Either disable them with `-m` module filtering in `run.sh`, or check for them in validation (Step 8). **Confirmed in the pilot:** 7 deaths from "Drug overdose" came from the built-in `opioid_addiction` module, not ours, so it *is* adding SUD-related records on top of the calibrated draw.
+
+### `docs/assumptions.md` (starter)
+
+Every simulation choice and every deviation from the standard ETL gets an ID, so the module's `remarks`, the run log and any write-up can point to the same place.
+
+```markdown
+# Simulation assumptions
+
+| ID | Assumption | Where | Status |
+|---|---|---|---|
+| A-001 | Disorder onset falls inside the 24-month export window (Guard `year >= 2025`) | `concurrent_disorders.json` → `Wait_Until_Adult_In_Window` | Placeholder |
+| A-002 | Survey "any mental illness" is coded as major depressive disorder (SNOMED 370143000) | `MHD_Onset`, `Both_MHD_Onset` | Needs clinical review |
+| A-003 | Survey "substance use disorder" is coded as alcoholism (SNOMED 7200002) | `SUD_Onset`, `Both_SUD_Onset` | Needs clinical review |
+| A-004 | Probabilities are uniform 0.25 placeholders for F 35–49 only | `Assign_Profile` | Pilot only; replace from NSDUH |
+| A-005 | Deaths dropped by ETL-Synthea are restored with `cause_concept_id = 0` | `services/etl/sql/patch_missing_deaths.sql` | Applied after every ETL |
+| A-006 | SNOMED `55680006` "Drug overdose" was retired in 2021 and has no `Maps to`; candidates 607147 "Overdose" / 4053782 "Overdose of opiate" | `cdm.death`, `cdm.condition_occurrence` | Unmapped (`0`) pending terminology review |
+| A-007 | SNOMED `94260004` maps to Cancer Modifier 35226112, which needs the Cancer Modifier vocabulary | Athena bundle (Step 3b) | Resolved by adding Cancer Modifier |
+```
 
 ### `services/synthea/keep/keep_concurrent.json` (optional)
 
@@ -1030,6 +1066,11 @@ exporter.fhir.export = true
 # 24 months of history in the export (A-001 depends on this matching the module's Guard).
 exporter.years_of_history = 2
 
+# Optional: the X12 claims exporter is on by default and nothing downstream uses it.
+# Turning it off keeps each run folder smaller. Keep metadata/ (on by default): it
+# records the run's settings, which is useful provenance.
+# exporter.x12.export = false
+
 # Leave the rest at defaults until there's a reason to change them.
 # Every change here goes in docs/run-log.md.
 ```
@@ -1042,11 +1083,34 @@ docker compose --profile generate run --rm synthea
 ls data/synthea-output/pilot-0001/csv/     # patients.csv, conditions.csv, encounters.csv …
 ```
 
-Add a row to **`docs/run-log.md`**:
+**Quick sanity check before the ETL.** This confirms the module ran and the joint draw produced all three non-"neither" groups. It counts *people*, not rows:
 
-| run_id | date | synthea | seed | pop | config hash | module hash | vocab release | NSDUH file | notes |
-|---|---|---|---|---|---|---|---|---|---|
-| pilot-0001 | 2026-11-xx | v3.3.0 | 12345 | 1000 | `sha256sum …` | `sha256sum …` | v5.0 xx-XXX-26 | NSDUH_2024_Tab.txt | first pilot |
+```bash
+cd data/synthea-output/pilot-0001/csv
+echo "patients: $(( $(wc -l < patients.csv) - 1 ))"
+
+awk -F',' '
+  # Find columns by header name, so this survives Synthea column changes
+  NR==1 { for (i=1;i<=NF;i++) { if ($i=="PATIENT") p=i; if ($i=="CODE") c=i }; next }
+  $c=="370143000" { mhd[$p]=1 }     # MDD (A-002)
+  $c=="7200002"   { sud[$p]=1 }     # alcoholism (A-003)
+  END {
+    for (x in mhd) if (x in sud) both++; else m++
+    for (x in sud) if (!(x in mhd)) s++
+    printf "mhd_only=%d  sud_only=%d  both=%d\n", m, s, both
+  }' conditions.csv
+cd - >/dev/null
+```
+
+> **Why more patients than `-p`?** Synthea's `-p` sets the number of **living** patients. People who die during their simulated lifetime are exported too, and `-a 18-85` constrains only the living, so deaths can date back decades. The pilot asked for 1,000 and got **1,175** (175 deceased). Check `DEATHDATE` in `patients.csv`.
+
+Add a row to **`docs/run-log.md`** (the pilot, as an example):
+
+| run_id | date | synthea | seed | pop | vocab release | CPT4 | ETL-Synthea SHA | notes |
+|---|---|---|---|---|---|---|---|---|
+| pilot-0001 | 2026-11-11 | v3.3.0 | 12345 | 1000 (1,175 incl. 175 deceased) | v5.0 29-AUG-26 | no | `<sha>` | **Placeholder 0.25 probabilities**, F 35–49 only. Plumbing test, NOT calibrated. Joint cells: mhd_only 35 / sud_only 35 / both 28. ETL dropped 18 deaths (Step 7b); patched. |
+
+Add config and module hashes (`sha256sum services/synthea/config/* services/synthea/modules/*`) in a notes column or a linked file, so any run can be reproduced exactly.
 
 ---
 
@@ -1191,10 +1255,199 @@ message("Done. Run the validation SQL next (services/etl/sql/validate_joint.sql)
 Run it:
 
 ```bash
-docker compose --profile etl build etl
+docker compose --profile etl build etl      # 10–20 min the first time (R packages compile)
 # First run: creates the CDM and loads the vocabulary. This can take a long time.
 docker compose --profile etl run --rm etl
 ```
+
+The `step()` logging prints `▶` / `✔` with timings for each stage. In the pilot, `LoadEventTables` alone took about 3 minutes; the vocabulary load is the long part. To watch a load in progress (row counts are estimates, and update as each table's load commits):
+
+```bash
+docker compose exec omop-db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "
+  SELECT schemaname, relname, n_live_tup
+    FROM pg_stat_user_tables
+   WHERE schemaname IN ('"'"'synthea'"'"','"'"'cdm'"'"')
+   ORDER BY n_live_tup DESC LIMIT 15;"'
+```
+
+### 7a. Verify the load
+
+Connect with DBeaver or pgAdmin at `localhost:5432` (database and credentials from `.env`), or open psql in the container:
+
+```bash
+docker compose exec omop-db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+```
+
+```sql
+-- 1. Core tables populated? person should match the patients.csv count (1,175 in the pilot)
+SELECT 'person' AS t, COUNT(*) FROM cdm.person
+UNION ALL SELECT 'observation_period',   COUNT(*) FROM cdm.observation_period
+UNION ALL SELECT 'visit_occurrence',     COUNT(*) FROM cdm.visit_occurrence
+UNION ALL SELECT 'condition_occurrence', COUNT(*) FROM cdm.condition_occurrence
+UNION ALL SELECT 'drug_exposure',        COUNT(*) FROM cdm.drug_exposure
+UNION ALL SELECT 'measurement',          COUNT(*) FROM cdm.measurement
+UNION ALL SELECT 'death',                COUNT(*) FROM cdm.death;
+
+-- 2. The provenance row the ETL wrote
+SELECT cdm_source_name, cdm_source_abbreviation, vocabulary_version, source_description
+  FROM cdm.cdm_source;
+
+-- 3. How much failed to map? Lower is better.
+SELECT ROUND(100.0 * AVG((condition_concept_id = 0)::int), 2) AS pct_unmapped_conditions
+  FROM cdm.condition_occurrence;
+
+-- 4. Your vocabulary-review worklist: the most common unmapped condition codes
+SELECT condition_source_value, COUNT(*) AS n
+  FROM cdm.condition_occurrence
+ WHERE condition_concept_id = 0
+ GROUP BY condition_source_value
+ ORDER BY n DESC
+ LIMIT 20;
+
+-- 5. Standard concept_ids for the module's codes. These replace the "0"
+--    placeholders in services/etl/sql/validate_joint.sql (Step 8b).
+SELECT DISTINCT co.condition_source_value, co.condition_concept_id, c.concept_name
+  FROM cdm.condition_occurrence co
+  JOIN cdm.concept c ON c.concept_id = co.condition_concept_id
+ WHERE co.condition_source_value IN ('370143000', '7200002');
+```
+
+**Reconcile counts at every stage.** For example, compare deceased patients in staging with rows in `cdm.death`:
+
+```sql
+SELECT (SELECT COUNT(*) FROM synthea.patients WHERE deathdate IS NOT NULL) AS deceased_in_synthea,
+       (SELECT COUNT(*) FROM cdm.death)                                    AS rows_in_cdm_death;
+```
+
+If those differ, see 7b. Comparing CSV → staging → CDM counts is how the pilot found its missing records.
+
+### 7b. Known ETL-Synthea gap: dropped deaths
+
+In the pilot, Synthea recorded **175** deaths but `cdm.death` held only **157**. `insert_death.sql` builds each death from the patient's **death-certification encounter** (SNOMED `308646001`) and **inner-joins** the cause of death to a standard concept. So a death is dropped entirely when:
+
+| Reason | Pilot count | Example |
+|---|---|---|
+| No death-certification encounter | 8 | Nothing to build the row from |
+| Cause code has no standard `Maps to` | 7 | `55680006` "Drug overdose", retired from SNOMED in 2021 (A-006) |
+| Cause maps into a vocabulary not downloaded | 3 | `94260004` → Cancer Modifier 35226112 (A-007; fixed by Step 3b) |
+
+That goes against OMOP's own convention, which is to **keep the record** with `concept_id = 0` when a value doesn't map. It also matters here specifically: in an SUD project, the deaths dropped most were **drug overdoses**.
+
+**Diagnose:**
+
+```sql
+-- Which deceased patients are missing, and do they have a death-cert encounter?
+SELECT p.id,
+       COUNT(e.id) FILTER (WHERE e.code = '308646001') AS death_cert_encounters
+  FROM synthea.patients p
+  JOIN cdm.person per ON per.person_source_value = p.id
+  LEFT JOIN cdm.death d ON d.person_id = per.person_id
+  LEFT JOIN synthea.encounters e ON e.patient = p.id
+ WHERE p.deathdate IS NOT NULL
+   AND d.person_id IS NULL
+ GROUP BY p.id;
+
+-- For those that do: what's the cause, and does it map?
+SELECT p.id, e.reasoncode, e.reasondescription,
+       c.concept_id AS source_concept_id, c.standard_concept, c.invalid_reason,
+       cr.concept_id_2 AS maps_to_standard_id
+  FROM synthea.patients p
+  JOIN cdm.person per ON per.person_source_value = p.id
+  LEFT JOIN cdm.death d ON d.person_id = per.person_id
+  JOIN synthea.encounters e ON e.patient = p.id AND e.code = '308646001'
+  LEFT JOIN cdm.concept c ON c.concept_code = e.reasoncode AND c.vocabulary_id = 'SNOMED'
+  LEFT JOIN cdm.concept_relationship cr
+         ON cr.concept_id_1 = c.concept_id AND cr.relationship_id = 'Maps to'
+ WHERE p.deathdate IS NOT NULL
+   AND d.person_id IS NULL;
+```
+
+To read the exact SQL the ETL ran:
+
+```bash
+docker compose --profile etl run --rm --entrypoint sh etl -c \
+  'f=$(Rscript -e "cat(system.file(\"sql\", package=\"ETLSyntheaBuilder\"))"); \
+   find "$f" -name "insert_death.sql" | head -1 | xargs cat'
+```
+
+**Fix: `services/etl/sql/patch_missing_deaths.sql`.** Run it after every ETL. It never guesses a mapping.
+
+```sql
+/**
+ * patch_missing_deaths.sql
+ *
+ * Restores deceased patients that ETL-Synthea's insert_death.sql drops when the
+ * cause of death has no standard "Maps to" concept, or there's no
+ * death-certification encounter (SNOMED 308646001).
+ *
+ * OMOP convention: an unmapped value keeps its row with concept_id = 0, and the
+ * original code stays in *_source_value. We never guess a mapping here.
+ *
+ * Run AFTER run_etl.R. Record it in docs/run-log.md (assumption A-005).
+ * Safe to rerun: it only inserts people who aren't already in cdm.death.
+ */
+INSERT INTO cdm.death (
+  person_id, death_date, death_datetime, death_type_concept_id,
+  cause_concept_id, cause_source_value, cause_source_concept_id
+)
+SELECT DISTINCT ON (per.person_id)               -- one row per person, even with duplicate encounters
+       per.person_id,
+       p.deathdate,
+       p.deathdate::timestamp,
+       32817,                                     -- EHR, matching the ETL's own rows
+       COALESCE(cr.concept_id_2, 0),              -- standard cause if it maps, else 0 (unmapped)
+       e.reasoncode,                              -- original SNOMED cause, kept for traceability
+       COALESCE(c.concept_id, 0)                  -- source concept, if the code exists in the vocab
+  FROM synthea.patients p
+  JOIN cdm.person per
+    ON per.person_source_value = p.id
+  LEFT JOIN cdm.death d
+    ON d.person_id = per.person_id
+  LEFT JOIN synthea.encounters e                  -- the cause lives on the death-cert encounter
+    ON e.patient = p.id AND e.code = '308646001'
+  LEFT JOIN cdm.concept c
+    ON c.concept_code = e.reasoncode AND c.vocabulary_id = 'SNOMED'
+  LEFT JOIN cdm.concept_relationship cr
+    ON cr.concept_id_1 = c.concept_id
+   AND cr.relationship_id = 'Maps to'
+   AND cr.invalid_reason IS NULL
+ WHERE p.deathdate IS NOT NULL
+   AND d.person_id IS NULL                        -- only people the ETL dropped
+ ORDER BY per.person_id;
+```
+
+```bash
+docker compose exec -T omop-db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"' \
+  < services/etl/sql/patch_missing_deaths.sql
+```
+
+Afterwards, `cdm.death` should match `deceased_in_synthea` from 7a. With Cancer Modifier in the vocabulary, the ETL itself handles the metastasis causes, so the patch inserts fewer rows (15 rather than 18 in the pilot).
+
+> This is also worth reporting upstream on the OHDSI/ETL-Synthea GitHub: dropping a whole death record over an unmapped cause contradicts the OMOP convention. The diagnostic queries above are a complete reproduction.
+
+### 7c. Pin, record, back up
+
+Once an ETL run succeeds:
+
+1. **Pin ETL-Synthea** to the commit that worked, so the next build gets identical code:
+   ```bash
+   docker compose --profile etl run --rm --entrypoint Rscript etl \
+     -e 'cat(packageDescription("ETLSyntheaBuilder")$RemoteSha, "\n")'
+   ```
+   Put the SHA in `ARG ETL_SYNTHEA_REF=<sha>` in `services/etl/Dockerfile`, and in the run log.
+2. **Record** the run in `docs/run-log.md`: vocabulary release, CPT4 yes/no, ETL SHA, any patches applied.
+3. **Back up** the loaded database, so you never sit through the vocabulary load again for the same release:
+   ```bash
+   mkdir -p backups
+   docker compose exec -T omop-db sh -c 'pg_dump -U "$POSTGRES_USER" -Fc "$POSTGRES_DB"' \
+     > "backups/omop-$(grep ^RUN_ID .env | cut -d= -f2).dump"
+   ```
+   Restore into a fresh volume with:
+   ```bash
+   docker compose exec -T omop-db sh -c 'pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB" --clean --if-exists' \
+     < backups/omop-pilot-0001.dump
+   ```
+   `backups/` is gitignored: dumps are large and contain the licensed vocabulary.
 
 ---
 
@@ -1202,7 +1455,7 @@ docker compose --profile etl run --rm etl
 
 ### 8a. Structural: Data Quality Dashboard
 
-Set `ETL_RUN_DQD=true` and rerun, or run the dashboard separately. Results land in `data/dqd/<run-id>/`. You can view them with `DataQualityDashboard::viewDqDashboard()` from an R session, or in Broadsea (Step 9).
+Set `ETL_RUN_DQD=true` and rerun (after `down -v`, because `LoadEventTables` needs empty tables), or run the dashboard separately against the loaded database. Results land in `data/dqd/<run-id>/`. You can view them with `DataQualityDashboard::viewDqDashboard()` from an R session, or in Broadsea (Step 9).
 
 ### 8b. Population: joint distribution vs targets
 
@@ -1216,7 +1469,7 @@ Set `ETL_RUN_DQD=true` and rerun, or run the dashboard separately. Results land 
  * proportions with the calibration targets.
  *
  * Replace the concept lists with the STANDARD concept_ids your module codes
- * map to. Look them up in cdm.concept / cdm.concept_relationship ('Maps to').
+ * map to. Query 5 in Step 7a lists them for you.
  *
  * @see docs/assumptions.md: the diagnosis code choices are assumptions.
  */
@@ -1303,7 +1556,11 @@ Networking: put both stacks on a shared Docker network, or point Broadsea at `ho
 - [ ] Module probabilities generated from JSON, not hand-typed
 - [ ] New `RUN_ID`; `COMMAND.txt` present in the output folder
 - [ ] `run-log.md` row complete: versions, seed, hashes, vocab release
+- [ ] Athena bundle includes **Cancer Modifier**; only the 10 vocabulary CSVs are in `data/vocab/athena/`
 - [ ] ETL finished without errors; `cdm.cdm_source` row describes the run
+- [ ] Step 7a counts reconcile (`person` = patients, `death` = deceased after the 7b patch)
+- [ ] Unmapped-codes worklist (7a query 4) reviewed; new retired codes added to `docs/assumptions.md`
+- [ ] ETL-Synthea commit SHA pinned and recorded; database backed up to `backups/`
 - [ ] DQD failure rate reviewed; known failures documented
 - [ ] `validate_joint.sql` results attached to the run-log row
 - [ ] Same run repeated with the same seed produces identical CSV hashes
@@ -1333,6 +1590,10 @@ Networking: put both stacks on a shared Docker network, or point Broadsea at `ho
 | Joint proportions skewed high | Built-in Synthea modules adding the same disorders | Filter modules with `-m`, or exclude them in validation |
 | Nobody in the "both" cell | Guard `year` is later than the simulation end date | Line the Guard up with the run's end date (A-001) |
 | Port 5432 in use | Local Postgres already running | Set `OMOP_DB_PORT=5433` in `.env` |
+| `cdm.death` has fewer rows than deceased patients | `insert_death.sql` drops deaths with no death-cert encounter or an unmapped cause | Step 7b: diagnose, then run `patch_missing_deaths.sql` |
+| A concept has `Maps to value` but no `Maps to` | Its `Maps to` target is in a vocabulary you didn't download (e.g. Cancer Modifier) | Check the concept on athena.ohdsi.org; add that vocabulary to the bundle and reload |
+| Common Synthea codes map to `0` | Synthea uses some SNOMED codes **retired** after it was written (`invalid_reason = 'D'`) | Expected. List them with 7a query 4 and record each in `docs/assumptions.md`; any mapping is a terminology-review decision |
+| `LoadVocabFromCsv` errors on unexpected files | Zip, jar, `CONCEPT_CPT4.csv` or `*_METADATA.csv` left in `data/vocab/athena/` | Move them to `athena-extras/` (Step 3b) |
 
 ---
 
@@ -1349,7 +1610,14 @@ Networking: put both stacks on a shared Docker network, or point Broadsea at `ho
 
 ## Further learning
 
-Lessons and lectures can be found since the `lessions/` folder, complete with lab work, lectures, and homework to learn more.
+Lessons and lectures can be found in the [`lessons/`](lessons/) folder, complete with lectures, lab work, and self-check questions to learn more:
+
+| Lesson | Covers |
+|---|---|
+| [001: The Pipeline from the Inside](lessons/001_pipeline-from-the-inside.md) | Containers, Compose networking, volumes, schemas, ETL, OMOP vocabularies |
+| [002: Calibration](lessons/002_calibration.md) | Survey weights, joint vs marginal probability, strata, sparse cells, sampling noise |
+
+Further reading:
 
 - **The Book of OHDSI.** Free, and the clearest explanation of the CDM, vocabularies and ETL: <https://ohdsi.github.io/TheBookOfOhdsi/>
 - **EHDEN Academy.** Free OMOP/ETL courses: <https://academy.ehden.eu/>
