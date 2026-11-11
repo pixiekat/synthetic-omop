@@ -1,0 +1,20 @@
+# EditorConfig: https://editorconfig.org
+# Keeps indentation consistent across editors and across the team.
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+indent_style = space
+indent_size = 2
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+# Markdown uses trailing double-space as a hard line break, so keep it.
+[*.md]
+trim_trailing_whitespace = false
+
+# Python convention is 4 spaces (PEP 8). Change this to 2 if you prefer
+# house style over PEP 8, but keep it consistent within the repo.
+[*.py]
+indent_size = 4

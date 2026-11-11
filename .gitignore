@@ -1,0 +1,14 @@
+# Secrets
+.env
+
+# Everything under data/ is large, licensed (Athena, NSDUH terms) or generated.
+# Keep the folder structure with .gitkeep files.
+data/**
+!data/**/
+!data/**/.gitkeep
+
+# R / Python cruft
+.Rhistory
+.RData
+__pycache__/
+*.pyc
