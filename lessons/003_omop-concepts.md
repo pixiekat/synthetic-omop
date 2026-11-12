@@ -7,7 +7,7 @@
 | **Prerequisites** | Lesson 001 (sections 4–6); basic SQL including `JOIN` |
 | **Project tables** | `cdm.concept`, `cdm.concept_relationship`, `cdm.concept_ancestor`, `cdm.vocabulary`, and any clinical table (`cdm.condition_occurrence`, `cdm.death`…) |
 | **Previous lesson** | 002: Calibration |
-| **Next lesson** | 004: Where Did 18 Deaths Go? (reconciling counts through an ETL) |
+| **Next lesson** | 004: Deep Dive into NSDUH, Synthea, Athena and the ETL |
 
 > **About the examples:** every concept ID in this lesson comes from the project's own
 > database, from the investigation we ran on the pilot load. You can look each one up
@@ -154,7 +154,7 @@ section 4 in action.
 > *Act 2:* after adding Cancer Modifier, the mapping appeared, but the three deaths were *still*
 > dropped. The ETL's death script only accepts causes whose standard concept is in the
 > **Condition** domain, and this one is a **Measurement**. Domains matter at every step, not just
-> when choosing a table. Lesson 004 tells the whole story.
+> when choosing a table. Lesson 005 tells the whole story.
 
 ---
 
