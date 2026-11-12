@@ -103,7 +103,8 @@ synthetic-omop/
 │   ├── 001_pipeline-from-the-inside.md
 │   ├── 002_calibration.md
 │   ├── 003_omop-concepts.md
-│   └── 004_pipeline-deep-dive.md
+│   ├── 004_pipeline-deep-dive.md
+│   └── 005_where-did-18-deaths-go.md
 │
 ├── backups/                       # ⚠ gitignored. pg_dump files of loaded databases (Step 7d)
 │
@@ -1695,6 +1696,7 @@ Lessons and lectures can be found in the [`lessons/`](lessons/) folder, complete
 | [002: Calibration](lessons/002_calibration.md) | Survey weights, joint vs marginal probability, strata, sparse cells, sampling noise |
 | [003: OMOP Concepts](lessons/003_omop-concepts.md) | Concepts, standard vs non-standard, domains, `Maps to`, hierarchies, deprecation, `concept_id = 0` |
 | [004: Pipeline Deep Dive](lessons/004_pipeline-deep-dive.md) | NSDUH design and limits (AMI as a model), Synthea modules, Athena bundles, ETL-Synthea stages and filters, provenance |
+| [005: Where Did 18 Deaths Go?](lessons/005_where-did-18-deaths-go.md) | Case study: reconciling counts through the ETL, six failure modes, responsible patching, writing it up |
 
 Further reading:
 
