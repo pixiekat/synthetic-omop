@@ -32,6 +32,8 @@ services:
       POSTGRES_DB: ${OMOP_DB_NAME}
       POSTGRES_USER: ${OMOP_DB_USER}
       POSTGRES_PASSWORD: ${OMOP_DB_PASSWORD}
+      # Read by the Step 9 setup scripts inside the container ($OHDSI_APP_PASSWORD).
+      OHDSI_APP_PASSWORD: ${OHDSI_APP_PASSWORD:-}
     ports:
       # Localhost only. Remove "127.0.0.1:" ONLY if you know you need LAN access.
       - "127.0.0.1:${OMOP_DB_PORT:-5432}:5432"
@@ -112,6 +114,84 @@ services:
       - ./data/vocab/athena:/data/vocab:ro
       - ./data/dqd:/data/dqd
       - ./services/etl:/app:ro
+
+  # ===========================================================================
+  # Optional OHDSI web stack (Step 9). Nothing below starts without
+  # `--profile atlas`.
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # webapi: OHDSI WebAPI (Java/Spring), the REST backend Atlas talks to.
+  # Two database jobs, both on omop-db as the least-privilege ohdsi_app role:
+  #   DATASOURCE_* / FLYWAY_*  → its OWN tables in schema "webapi"
+  #                              (Flyway creates them on first start)
+  #   webapi.source rows       → where the CDM lives (Step 9c registers it)
+  # ---------------------------------------------------------------------------
+  webapi:
+    profiles: ["atlas"]
+    image: ohdsi/webapi:${WEBAPI_VERSION:-2.15.1}
+    container_name: ohdsi-webapi
+    restart: unless-stopped
+    depends_on:
+      omop-db:
+        condition: service_healthy
+    environment:
+      JAVA_OPTS: "-Xmx2g"
+      # --- WebAPI's own database (schema webapi) ---
+      DATASOURCE_DRIVERCLASSNAME: org.postgresql.Driver
+      DATASOURCE_URL: jdbc:postgresql://omop-db:5432/${OMOP_DB_NAME}
+      DATASOURCE_USERNAME: ohdsi_app
+      DATASOURCE_PASSWORD: ${OHDSI_APP_PASSWORD}
+      DATASOURCE_OHDSI_SCHEMA: webapi
+      SPRING_JPA_PROPERTIES_HIBERNATE_DEFAULT_SCHEMA: webapi
+      SPRING_JPA_PROPERTIES_HIBERNATE_DIALECT: org.hibernate.dialect.PostgreSQLDialect
+      SPRING_BATCH_REPOSITORY_TABLEPREFIX: webapi.BATCH_
+      # --- Flyway: builds/upgrades the webapi schema on startup ---
+      FLYWAY_DATASOURCE_DRIVERCLASSNAME: org.postgresql.Driver
+      FLYWAY_DATASOURCE_URL: jdbc:postgresql://omop-db:5432/${OMOP_DB_NAME}
+      FLYWAY_DATASOURCE_USERNAME: ohdsi_app
+      FLYWAY_DATASOURCE_PASSWORD: ${OHDSI_APP_PASSWORD}
+      FLYWAY_LOCATIONS: classpath:db/migration/postgresql
+      FLYWAY_SCHEMAS: webapi
+      FLYWAY_PLACEHOLDERS_OHDSISCHEMA: webapi
+      FLYWAY_TABLE: schema_history
+      # --- Security: OFF. Acceptable ONLY because this is synthetic data on
+      # 127.0.0.1. Anyone who can reach the port can edit anything in Atlas.
+      SECURITY_PROVIDER: DisabledSecurity
+      SECURITY_CORS_ENABLED: "true"
+      SECURITY_ORIGIN: "http://localhost:${ATLAS_PORT:-8080}"
+    # No "ports:". WebAPI is reached only through atlas-proxy.
+
+  # ---------------------------------------------------------------------------
+  # atlas: the Atlas web app (static files served by nginx inside the image).
+  # WEBAPI_URL is read by YOUR BROWSER, not by this container, so it must be
+  # an address the browser can reach (localhost), never "webapi:8080".
+  # ---------------------------------------------------------------------------
+  atlas:
+    profiles: ["atlas"]
+    image: ohdsi/atlas:${ATLAS_VERSION:-2.15.0}
+    container_name: ohdsi-atlas
+    restart: unless-stopped
+    depends_on:
+      - webapi
+    environment:
+      WEBAPI_URL: "http://localhost:${ATLAS_PORT:-8080}/WebAPI/"
+
+  # ---------------------------------------------------------------------------
+  # atlas-proxy: one origin for both apps (see services/atlas/nginx.conf).
+  # ---------------------------------------------------------------------------
+  atlas-proxy:
+    profiles: ["atlas"]
+    image: nginx:1.27-alpine
+    container_name: ohdsi-proxy
+    restart: unless-stopped
+    depends_on:
+      - atlas
+      - webapi
+    ports:
+      - "127.0.0.1:${ATLAS_PORT:-8080}:8080"
+    volumes:
+      - ./services/atlas/nginx.conf:/etc/nginx/conf.d/default.conf:ro
 
 volumes:
   omop-pgdata:

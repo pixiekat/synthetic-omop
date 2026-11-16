@@ -6,7 +6,8 @@
 |---|---|
 | **Status** | **Pilot run end to end** (`pilot-0001`, 2026-11-11): Synthea → ETL-Synthea → OMOP 5.4 loaded and checked. Calibration still uses **placeholder** probabilities; real NSDUH estimates are the next milestone. |
 | **Audience** | Engineers who build the pipeline (admin) and analysts who use the resulting database (non-admin) |
-| **Pinned versions** | Synthea `v3.3.0`, OMOP CDM `5.4`, ETL-Synthea (`OHDSI/ETL-Synthea`, pinned to a commit), PostgreSQL `16`, Athena vocabulary `v5.0 29-AUG-26` |
+| **Pinned versions** | Synthea `v3.3.0`, OMOP CDM `5.4`, ETL-Synthea (`OHDSI/ETL-Synthea`, pinned to a commit), PostgreSQL `16`, Athena vocabulary `v5.0 29-AUG-26`, WebAPI `2.15.1` + Atlas `2.15.0` (optional, Step 9) |
+| **Atlas status** | Step 9 is **new and not yet run end to end**. The setup SQL was tested on PostgreSQL 16 with mock WebAPI tables; the containers haven't been started yet. Record the first run in `docs/run-log.md`. |
 | **Source notes** | Builds on the OMOP project's planning notes. The method is unchanged; this guide adds the local Docker setup. |
 | **Lessons** | Teaching material for this pipeline lives in [`lessons/`](lessons/) (see [Further learning](#further-learning)). |
 
@@ -29,7 +30,14 @@
     - [7c. Known ETL-Synthea gap: dropped immunizations](#7c-known-etl-synthea-gap-dropped-immunizations)
     - [7d. Pin, record, back up](#7d-pin-record-back-up)
 11. [Step 8: Validate](#step-8-validate)
-12. [Step 9 (optional): Atlas via OHDSI Broadsea](#step-9-optional-atlas-via-ohdsi-broadsea)
+12. [Step 9 (optional): ATLAS and WebAPI](#step-9-optional-atlas-and-webapi)
+    - [9a. How the pieces fit](#9a-how-the-pieces-fit)
+    - [9b. Prepare the database and start WebAPI](#9b-prepare-the-database-and-start-webapi)
+    - [9c. Register our CDM as a source](#9c-register-our-cdm-as-a-source)
+    - [9d. Create the results tables](#9d-create-the-results-tables)
+    - [9e. Run Achilles (Data Sources reports)](#9e-run-achilles-data-sources-reports)
+    - [9f. Open Atlas and check it](#9f-open-atlas-and-check-it)
+    - [9g. Alternative: full Broadsea](#9g-alternative-full-broadsea)
 13. [QA checklist](#qa-checklist)
 14. [Troubleshooting](#troubleshooting)
 15. [Security and usability suggestions](#security-and-usability-suggestions)
@@ -104,7 +112,10 @@ synthetic-omop/
 │   ├── 002_calibration.md
 │   ├── 003_omop-concepts.md
 │   ├── 004_pipeline-deep-dive.md
-│   └── 005_where-did-18-deaths-go.md
+│   ├── 005_where-did-18-deaths-go.md
+│   ├── 006_intro-to-atlas.md
+│   ├── 007_atlas-deep-dive.md
+│   └── 008_our-atlas-setup-and-the-ui.md
 │
 ├── backups/                       # ⚠ gitignored. pg_dump files of loaded databases (Step 7d)
 │
@@ -114,6 +125,7 @@ synthetic-omop/
 │   ├── vocab/
 │   │   ├── athena/                # The 10 OMOP vocabulary CSVs ONLY (the ETL reads this folder)
 │   │   └── athena-extras/         # Original zip, CPT4 tool, *_METADATA files (kept out of the ETL's way)
+│   ├── atlas/                     # Generated results DDL from WebAPI (Step 9d), kept for provenance
 │   ├── calibration/               # Output of Step 4 (joint_probabilities.json)
 │   ├── synthea-output/
 │   │   └── <run-id>/csv/          # One folder per Synthea run
@@ -123,6 +135,11 @@ synthetic-omop/
     ├── postgres/
     │   └── initdb/
     │       └── 01_schemas.sql     # Creates synthea / cdm / results schemas
+    ├── atlas/                     # Optional OHDSI web stack (Step 9)
+    │   ├── nginx.conf             # One front door: /atlas → Atlas, /WebAPI → WebAPI
+    │   └── sql/
+    │       ├── 01_roles_and_schemas.sql   # ohdsi_app role; webapi + temp schemas; grants
+    │       └── 02_register_source.sql     # Registers omop-db as a WebAPI source (daimons)
     ├── calibration/
     │   ├── Dockerfile
     │   ├── requirements.txt
@@ -140,6 +157,7 @@ synthetic-omop/
     └── etl/
         ├── Dockerfile
         ├── run_etl.R              # ETL-Synthea call sequence, step toggles
+        ├── run_achilles.R         # Characterization for Atlas's Data Sources pages (Step 9e)
         └── sql/
             ├── validate_joint.sql               # Compares OMOP joint counts to targets
             ├── patch_missing_deaths.sql         # Restores deaths the standard ETL drops (Step 7b)
@@ -239,6 +257,17 @@ SYNTHEA_STATE=Massachusetts
 ETL_CREATE_CDM=true
 ETL_LOAD_VOCAB=true
 ETL_RUN_DQD=false
+
+# --- Optional: ATLAS / WebAPI (Step 9, profile "atlas") ----------------------
+# Login for the least-privilege ohdsi_app role WebAPI uses. It goes into a JDBC
+# URL, so letters, digits, _ and - ONLY, and at least 16 characters.
+# Generate one with:  openssl rand -hex 24
+OHDSI_APP_PASSWORD=change-me-hex-from-openssl
+# Keep WebAPI and Atlas on the same minor version (2.15 ↔ 2.15).
+WEBAPI_VERSION=2.15.1
+ATLAS_VERSION=2.15.0
+# Host port for the Atlas/WebAPI proxy (bound to 127.0.0.1).
+ATLAS_PORT=8080
 ```
 
 ---
@@ -258,12 +287,14 @@ Services sit behind **profiles**, so the plain `docker compose up` starts only t
 #   calibrate   → estimate joint disorder probabilities from NSDUH (Step 4)
 #   generate    → run Synthea with our module (Step 6)
 #   etl         → load Synthea CSV + Athena vocab into OMOP (Step 7)
+#   atlas       → OHDSI WebAPI + Atlas + proxy, optional (Step 9)
 #
 # Usage:
 #   docker compose up -d                                   # database
 #   docker compose --profile calibrate run --rm calibration
 #   docker compose --profile generate  run --rm synthea
 #   docker compose --profile etl       run --rm etl
+#   docker compose --profile atlas     up -d               # long-running web stack
 # =============================================================================
 name: synthetic-omop
 
@@ -275,6 +306,9 @@ services:
   #   synthea → raw Synthea staging tables
   #   cdm     → OMOP CDM + vocabulary tables
   #   results → analysis output (Achilles / Atlas / our validation)
+  # Created later by services/atlas/sql/01_roles_and_schemas.sql (Step 9):
+  #   webapi  → WebAPI's own application tables
+  #   temp    → WebAPI scratch space for cohort generation
   # ---------------------------------------------------------------------------
   omop-db:
     image: postgres:16
@@ -284,6 +318,10 @@ services:
       POSTGRES_DB: ${OMOP_DB_NAME}
       POSTGRES_USER: ${OMOP_DB_USER}
       POSTGRES_PASSWORD: ${OMOP_DB_PASSWORD}
+      # Not used by Postgres itself. It's here so the Step 9 setup scripts can
+      # read it INSIDE the container ($OHDSI_APP_PASSWORD), the same way the
+      # other psql commands in this guide read $POSTGRES_USER.
+      OHDSI_APP_PASSWORD: ${OHDSI_APP_PASSWORD:-}
     ports:
       # Localhost only. Remove "127.0.0.1:" ONLY if you know you need LAN access.
       - "127.0.0.1:${OMOP_DB_PORT:-5432}:5432"
@@ -373,6 +411,84 @@ services:
       - ./data/vocab/athena:/data/vocab:ro
       - ./data/dqd:/data/dqd
       - ./services/etl:/app:ro
+
+  # ===========================================================================
+  # Optional OHDSI web stack (Step 9). Nothing below starts without
+  # `--profile atlas`.
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # webapi: OHDSI WebAPI (Java/Spring), the REST backend Atlas talks to.
+  # Two database jobs, both on omop-db as the least-privilege ohdsi_app role:
+  #   DATASOURCE_* / FLYWAY_*  → its OWN tables in schema "webapi"
+  #                              (Flyway creates them on first start)
+  #   webapi.source rows       → where the CDM lives (Step 9c registers it)
+  # ---------------------------------------------------------------------------
+  webapi:
+    profiles: ["atlas"]
+    image: ohdsi/webapi:${WEBAPI_VERSION:-2.15.1}
+    container_name: ohdsi-webapi
+    restart: unless-stopped
+    depends_on:
+      omop-db:
+        condition: service_healthy
+    environment:
+      JAVA_OPTS: "-Xmx2g"
+      # --- WebAPI's own database (schema webapi) ---
+      DATASOURCE_DRIVERCLASSNAME: org.postgresql.Driver
+      DATASOURCE_URL: jdbc:postgresql://omop-db:5432/${OMOP_DB_NAME}
+      DATASOURCE_USERNAME: ohdsi_app
+      DATASOURCE_PASSWORD: ${OHDSI_APP_PASSWORD}
+      DATASOURCE_OHDSI_SCHEMA: webapi
+      SPRING_JPA_PROPERTIES_HIBERNATE_DEFAULT_SCHEMA: webapi
+      SPRING_JPA_PROPERTIES_HIBERNATE_DIALECT: org.hibernate.dialect.PostgreSQLDialect
+      SPRING_BATCH_REPOSITORY_TABLEPREFIX: webapi.BATCH_
+      # --- Flyway: builds/upgrades the webapi schema on startup ---
+      FLYWAY_DATASOURCE_DRIVERCLASSNAME: org.postgresql.Driver
+      FLYWAY_DATASOURCE_URL: jdbc:postgresql://omop-db:5432/${OMOP_DB_NAME}
+      FLYWAY_DATASOURCE_USERNAME: ohdsi_app
+      FLYWAY_DATASOURCE_PASSWORD: ${OHDSI_APP_PASSWORD}
+      FLYWAY_LOCATIONS: classpath:db/migration/postgresql
+      FLYWAY_SCHEMAS: webapi
+      FLYWAY_PLACEHOLDERS_OHDSISCHEMA: webapi
+      FLYWAY_TABLE: schema_history
+      # --- Security: OFF. Acceptable ONLY because this is synthetic data on
+      # 127.0.0.1. Anyone who can reach the port can edit anything in Atlas.
+      SECURITY_PROVIDER: DisabledSecurity
+      SECURITY_CORS_ENABLED: "true"
+      SECURITY_ORIGIN: "http://localhost:${ATLAS_PORT:-8080}"
+    # No "ports:". WebAPI is reached only through atlas-proxy.
+
+  # ---------------------------------------------------------------------------
+  # atlas: the Atlas web app (static files served by nginx inside the image).
+  # WEBAPI_URL is read by YOUR BROWSER, not by this container, so it must be
+  # an address the browser can reach (localhost), never "webapi:8080".
+  # ---------------------------------------------------------------------------
+  atlas:
+    profiles: ["atlas"]
+    image: ohdsi/atlas:${ATLAS_VERSION:-2.15.0}
+    container_name: ohdsi-atlas
+    restart: unless-stopped
+    depends_on:
+      - webapi
+    environment:
+      WEBAPI_URL: "http://localhost:${ATLAS_PORT:-8080}/WebAPI/"
+
+  # ---------------------------------------------------------------------------
+  # atlas-proxy: one origin for both apps (see services/atlas/nginx.conf).
+  # ---------------------------------------------------------------------------
+  atlas-proxy:
+    profiles: ["atlas"]
+    image: nginx:1.27-alpine
+    container_name: ohdsi-proxy
+    restart: unless-stopped
+    depends_on:
+      - atlas
+      - webapi
+    ports:
+      - "127.0.0.1:${ATLAS_PORT:-8080}:8080"
+    volumes:
+      - ./services/atlas/nginx.conf:/etc/nginx/conf.d/default.conf:ro
 
 volumes:
   omop-pgdata:
@@ -1136,11 +1252,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   && R CMD javareconf \
   && rm -rf /var/lib/apt/lists/*
 
-# Pin ETL-Synthea to a COMMIT SHA once one works (reproducibility).
-ARG ETL_SYNTHEA_REF=main
+# ETL-Synthea pinned to the commit that loaded pilot-0001 (Step 7d; see docs/run-log.md).
+# TODO: pin DataQualityDashboard too (ARG DQD_REF + ref='${DQD_REF}').
+ARG ETL_SYNTHEA_REF=9ee6eb1b933c70af7b80711332aa92327af1f7c5
+# The last line fails the build if any package didn't install. `R -e` exits 0
+# even when an install fails, so without it a broken image still says "Built".
+# Note R package names differ from repo names (OHDSI/ETL-Synthea → ETLSyntheaBuilder).
 RUN R -q -e "install.packages(c('remotes','DatabaseConnector','SqlRender'), repos='https://cloud.r-project.org')" \
   && R -q -e "remotes::install_github('OHDSI/ETL-Synthea', ref='${ETL_SYNTHEA_REF}', upgrade='never')" \
-  && R -q -e "remotes::install_github('OHDSI/DataQualityDashboard', upgrade='never')"
+  && R -q -e "remotes::install_github('OHDSI/DataQualityDashboard', upgrade='never')" \
+  && R -q -e "pkgs <- c('remotes','DatabaseConnector','SqlRender','ETLSyntheaBuilder','DataQualityDashboard'); \
+              missing <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]; \
+              if (length(missing)) { message('MISSING R packages: ', paste(missing, collapse = ', ')); quit(status = 1) }"
+
+# Achilles: characterization tables for Atlas's Data Sources pages (Step 9e).
+# Its own layer, so adding it doesn't rebuild the ETL layers above.
+#
+# Gotcha: `R -e "install.packages(...)"` exits 0 even when the install FAILS
+# (R only prints a warning), so Docker happily reports "Built". The
+# requireNamespace() check turns a failed install into a failed build.
+RUN R -q -e "install.packages('Achilles', repos='https://cloud.r-project.org'); \
+             if (!requireNamespace('Achilles', quietly = TRUE)) quit(status = 1)"
 
 # Download the Postgres JDBC driver at BUILD time so runs work offline.
 ENV DATABASECONNECTOR_JAR_FOLDER=/opt/jdbc
@@ -1529,7 +1661,7 @@ Once an ETL run succeeds:
 
 ### 8a. Structural: Data Quality Dashboard
 
-Set `ETL_RUN_DQD=true` and rerun (after `down -v`, because `LoadEventTables` needs empty tables), or run the dashboard separately against the loaded database. Results land in `data/dqd/<run-id>/`. You can view them with `DataQualityDashboard::viewDqDashboard()` from an R session, or in Broadsea (Step 9).
+Set `ETL_RUN_DQD=true` and rerun (after `down -v`, because `LoadEventTables` needs empty tables), or run the dashboard separately against the loaded database. Results land in `data/dqd/<run-id>/`. You can view them with `DataQualityDashboard::viewDqDashboard()` from an R session. Atlas (Step 9) doesn't display DQD results; its Data Sources pages come from Achilles instead.
 
 ### 8b. Population: joint distribution vs targets
 
@@ -1599,22 +1731,507 @@ SELECT CASE
 
 ---
 
-## Step 9 (optional): Atlas via OHDSI Broadsea
+## Step 9 (optional): ATLAS and WebAPI
 
-**OHDSI Broadsea** (<https://github.com/OHDSI/Broadsea>) runs the OHDSI web stack (Atlas, WebAPI, HADES/RStudio and others) with Docker Compose profiles. Use it when analysts need to build cohorts in a UI.
+**ATLAS** is OHDSI's web tool for working with an OMOP database without writing SQL: searching the vocabulary, building **concept sets** and **cohort definitions**, generating cohorts, and browsing **Data Sources** reports. **WebAPI** is the Java backend that does the actual database work for it.
 
-```bash
-# Separate folder. Don't merge Broadsea's compose into ours.
-git clone https://github.com/OHDSI/Broadsea.git
-cd Broadsea
-git checkout <latest tagged release>   # pin it; see the Releases page
-# Read Broadsea's README for its current .env options for pointing WebAPI at
-# an external CDM. In outline: register our omop-db as a WebAPI "source" with
-# cdm / vocab / results daimons → schemas cdm / cdm / results.
-docker compose --profile default up -d
+This step adds both to *our* Compose file as an optional `atlas` profile, pointed at the `omop-db` we already loaded. Nothing changes for Steps 1–8, and none of it starts unless you ask for it.
+
+> **Versions.** Pinned to **WebAPI 2.15.1 + Atlas 2.15.0**, the current stable 2.x line on Docker Hub. **WebAPI 3.0** was released very recently, with a security rework (Spring Security replaces Shiro), a new Flyway baseline, and i18n removed. **Atlas 3.0** (a Vue rebuild) was in public preview in July 2026, with a final release planned for later in 2026. Revisit the pin once Atlas 3.0 is released and Broadsea supports it. **Never mix majors:** Atlas 2.x needs WebAPI 2.x.
+
+### 9a. How the pieces fit
+
+```
+ Your browser
+     │  http://localhost:8080
+     ▼
+ ┌──────────────────────── atlas-proxy (nginx) ────────────────────────┐
+ │   /atlas/  ──▶ atlas   (static JavaScript app, runs IN the browser)  │
+ │   /WebAPI/ ──▶ webapi  (Java REST API, the only part touching the DB)│
+ └──────────────────────────────────────────────────────────┬──────────┘
+                                                            │ JDBC, as role ohdsi_app
+                                                            ▼
+ omop-db / synthetic_concurrent
+   ├── webapi   WebAPI's own tables (cohort definitions, concept sets, jobs)   owner
+   ├── cdm      OMOP CDM + vocabulary (from Step 7)                            read only
+   ├── results  cohorts, Achilles counts, concept hierarchy                    read + write
+   └── temp     scratch tables during cohort generation                        owner
 ```
 
-Networking: put both stacks on a shared Docker network, or point Broadsea at `host.docker.internal:5432`. The first option is cleaner.
+Three ideas to hold on to:
+
+1. **Atlas never talks to the database.** It's a web page in your browser that calls WebAPI. That's why `WEBAPI_URL` in `compose.yaml` says `localhost`: the *browser* resolves it, not a container.
+2. **WebAPI uses the database twice.** Once for its own bookkeeping (schema `webapi`, built by **Flyway** migrations on first start), and once to query our CDM, which it learns about from rows in `webapi.source` and `webapi.source_daimon` (9c).
+3. **Least privilege.** WebAPI connects as a dedicated role, `ohdsi_app`, that can read `cdm` but never change it. The ETL stays the only writer of clinical data.
+
+### 9b. Prepare the database and start WebAPI
+
+**1. Set the password** in `.env` (letters, digits, `_` and `-` only, at least 16 characters, because it ends up inside a JDBC URL):
+
+```bash
+openssl rand -hex 24          # paste the output into .env as OHDSI_APP_PASSWORD=
+```
+
+**2. Recreate the database container** so it picks up the new variable. Only the container is replaced; the `omop-pgdata` volume, and everything loaded in Step 7, stays.
+
+```bash
+docker compose up -d omop-db
+docker compose exec omop-db sh -c 'test -n "$OHDSI_APP_PASSWORD" && echo "password visible in container"'
+```
+
+**3. Create the role, schemas and grants.** Safe to rerun.
+
+```bash
+docker compose exec -T omop-db sh -c 'psql -v ON_ERROR_STOP=1 \
+  -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+  -v admin_role="$POSTGRES_USER" -v app_pw="$OHDSI_APP_PASSWORD"' \
+  < services/atlas/sql/01_roles_and_schemas.sql
+```
+
+#### `services/atlas/sql/01_roles_and_schemas.sql`
+
+```sql
+/**
+ * 01_roles_and_schemas.sql: prepare omop-db for WebAPI/Atlas (Step 9b)
+ *
+ * Run BEFORE the first WebAPI start, as the admin role. Safe to rerun: every
+ * statement checks first or is idempotent, and the password is re-applied each
+ * time (so rotating OHDSI_APP_PASSWORD in .env just means rerunning this).
+ *
+ * What it creates
+ *   role   ohdsi_app   Least-privilege login used by WebAPI for BOTH of its jobs:
+ *                      (1) its own application tables (schema webapi), and
+ *                      (2) querying our CDM as a registered "source".
+ *   schema webapi      WebAPI's own tables. Created EMPTY here; WebAPI's Flyway
+ *                      migrations fill it on first start.
+ *   schema temp        Scratch space WebAPI uses while generating cohorts.
+ *
+ * What ohdsi_app can do
+ *   cdm      read only    (the ETL, as the admin role, stays the only writer)
+ *   results  read + write (cohort generation, Achilles reports)
+ *   webapi   owner
+ *   temp     owner
+ *
+ * Invocation (from the project root; variables come from omop-db's environment):
+ *
+ *   docker compose exec -T omop-db sh -c 'psql -v ON_ERROR_STOP=1 \
+ *     -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+ *     -v admin_role="$POSTGRES_USER" -v app_pw="$OHDSI_APP_PASSWORD"' \
+ *     < services/atlas/sql/01_roles_and_schemas.sql
+ *
+ * psql variable syntax used below:
+ *   :'var'  → the value as a quoted SQL literal   ('s3cret')
+ *   :"var"  → the value as a quoted identifier    ("omop_admin")
+ *
+ * @see https://www.postgresql.org/docs/16/app-psql.html#APP-PSQL-INTERPOLATION
+ */
+
+-- ---------------------------------------------------------------------------
+-- Guard rails: fail loudly on a missing or URL-unsafe password.
+-- The password ends up inside a JDBC URL (02_register_source.sql), where
+-- characters like @ : / ? & # would break parsing, so we require a plain
+-- alphanumeric password (make it long instead of "complex").
+-- ---------------------------------------------------------------------------
+SELECT length(:'app_pw') >= 16                AS pw_long_enough,
+       :'app_pw' ~ '^[A-Za-z0-9_-]+$'         AS pw_url_safe
+\gset
+
+\if :pw_long_enough
+\else
+  SELECT length(:'app_pw') AS pw_len
+  \gset
+  \echo 'ERROR: OHDSI_APP_PASSWORD inside omop-db is' :pw_len 'characters (need 16+). Check, in order:'
+  \echo '  1. .env sets it:              grep -c ^OHDSI_APP_PASSWORD= .env'
+  \echo '  2. compose.yaml passes it:    docker compose config | grep OHDSI_APP_PASSWORD'
+  \echo '     (omop-db -> environment: needs  OHDSI_APP_PASSWORD: ${OHDSI_APP_PASSWORD:-} )'
+  \echo '  3. container was recreated:   docker compose up -d omop-db   (should say Recreated)'
+  DO $$ BEGIN RAISE EXCEPTION 'OHDSI_APP_PASSWORD too short'; END $$;
+\endif
+
+\if :pw_url_safe
+\else
+  \echo 'ERROR: OHDSI_APP_PASSWORD may only contain letters, digits, _ and - (it goes into a JDBC URL).'
+  DO $$ BEGIN RAISE EXCEPTION 'OHDSI_APP_PASSWORD not URL-safe'; END $$;
+\endif
+
+-- ---------------------------------------------------------------------------
+-- Role: create once, then (re)set the password every run.
+-- ---------------------------------------------------------------------------
+SELECT NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ohdsi_app') AS need_role
+\gset
+
+\if :need_role
+  CREATE ROLE ohdsi_app LOGIN;
+  \echo 'Created role ohdsi_app.'
+\else
+  \echo 'Role ohdsi_app exists... skipping create.'
+\endif
+
+ALTER ROLE ohdsi_app WITH LOGIN PASSWORD :'app_pw';
+
+-- ---------------------------------------------------------------------------
+-- Schemas WebAPI owns.
+-- ---------------------------------------------------------------------------
+CREATE SCHEMA IF NOT EXISTS webapi AUTHORIZATION ohdsi_app;
+CREATE SCHEMA IF NOT EXISTS temp   AUTHORIZATION ohdsi_app;
+
+-- If the schemas already existed under another owner, hand them over.
+ALTER SCHEMA webapi OWNER TO ohdsi_app;
+ALTER SCHEMA temp   OWNER TO ohdsi_app;
+
+-- ---------------------------------------------------------------------------
+-- cdm: read only.
+-- ---------------------------------------------------------------------------
+GRANT USAGE  ON SCHEMA cdm                TO ohdsi_app;
+GRANT SELECT ON ALL TABLES IN SCHEMA cdm  TO ohdsi_app;
+
+-- Tables the admin creates in cdm LATER (e.g. a fresh ETL) get the same grant.
+ALTER DEFAULT PRIVILEGES FOR ROLE :"admin_role" IN SCHEMA cdm
+  GRANT SELECT ON TABLES TO ohdsi_app;
+
+-- ---------------------------------------------------------------------------
+-- results: read and write (cohort tables, Achilles output, concept hierarchy).
+-- ---------------------------------------------------------------------------
+GRANT USAGE, CREATE ON SCHEMA results                 TO ohdsi_app;
+GRANT ALL ON ALL TABLES    IN SCHEMA results          TO ohdsi_app;
+GRANT ALL ON ALL SEQUENCES IN SCHEMA results          TO ohdsi_app;
+
+-- Covers tables made later by the admin: the results DDL (9d) and Achilles (9e).
+ALTER DEFAULT PRIVILEGES FOR ROLE :"admin_role" IN SCHEMA results
+  GRANT ALL ON TABLES    TO ohdsi_app;
+ALTER DEFAULT PRIVILEGES FOR ROLE :"admin_role" IN SCHEMA results
+  GRANT ALL ON SEQUENCES TO ohdsi_app;
+
+\echo '01_roles_and_schemas.sql finished.'
+```
+
+**4. Start the web stack** and wait for WebAPI. The first start runs WebAPI's Flyway migrations (many of them), so give it a few minutes.
+
+```bash
+docker compose --profile atlas up -d
+docker compose --profile atlas logs -f webapi        # Ctrl-C once it settles
+
+# Ready when this prints JSON containing "version":"2.15.1"
+until curl -fsS http://localhost:8080/WebAPI/info; do sleep 10; done; echo
+```
+
+Check that Flyway built the schema:
+
+```bash
+docker compose exec omop-db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c \
+  "SELECT COUNT(*) AS webapi_tables FROM information_schema.tables WHERE table_schema = '\''webapi'\''"'
+```
+
+#### `services/atlas/nginx.conf`
+
+```nginx
+# =============================================================================
+# services/atlas/nginx.conf: one front door for Atlas and WebAPI
+#
+# Why a proxy at all?
+#   Atlas is a web page that runs in YOUR BROWSER and calls WebAPI over HTTP.
+#   If the two lived on different ports (say 8081 and 8080), the browser would
+#   treat every call as cross-origin, and WebAPI would need CORS configured
+#   correctly. Serving both from one address avoids that whole class of error:
+#
+#     http://localhost:8080/          → redirects to /atlas/
+#     http://localhost:8080/atlas/    → atlas container  (static Atlas app)
+#     http://localhost:8080/WebAPI/   → webapi container (Java REST API)
+#
+#   This is the same idea as Broadsea's Traefik proxy, written out by hand so
+#   you can read it.
+#
+# @see https://nginx.org/en/docs/http/ngx_http_proxy_module.html
+# =============================================================================
+
+server {
+  listen 8080;
+
+  # Keep redirects relative ("Location: /atlas/"), so they still work when the
+  # host port in .env (ATLAS_PORT) isn't 8080.
+  absolute_redirect off;
+
+  # Cohort generation and the results DDL can take minutes on a full vocabulary.
+  proxy_read_timeout 600s;
+  proxy_send_timeout 600s;
+
+  # Pass the original host and scheme through, so WebAPI builds correct links.
+  proxy_set_header Host              $http_host;
+  proxy_set_header X-Real-IP         $remote_addr;
+  proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+
+  # Bare address → Atlas.
+  location = / {
+    return 302 /atlas/;
+  }
+
+  # The Atlas image serves the app under /atlas/ itself, so the path is passed
+  # through unchanged (no trailing slash on proxy_pass = no prefix stripping).
+  # @see README Troubleshooting if /atlas/ returns 404.
+  location /atlas/ {
+    proxy_pass http://atlas:8080;
+  }
+
+  # WebAPI's context path is /WebAPI (capital W-A-P-I, case-sensitive).
+  location /WebAPI/ {
+    proxy_pass http://webapi:8080;
+  }
+}
+```
+
+To stop just the web stack (the database keeps running): `docker compose --profile atlas stop atlas-proxy atlas webapi`.
+
+### 9c. Register our CDM as a source
+
+WebAPI now runs, but it doesn't know our CDM exists. A **source** is one database it can query; its **daimons** say which schema plays which role (CDM, Vocabulary, Results, Temp).
+
+```bash
+docker compose exec -T omop-db sh -c 'psql -v ON_ERROR_STOP=1 \
+  -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+  -v db_name="$POSTGRES_DB" -v app_pw="$OHDSI_APP_PASSWORD"' \
+  < services/atlas/sql/02_register_source.sql
+
+# WebAPI caches its source list at startup, so restart it, then confirm.
+docker compose --profile atlas restart webapi
+until curl -fsS http://localhost:8080/WebAPI/info >/dev/null; do sleep 5; done
+curl -fsS http://localhost:8080/WebAPI/source/sources; echo     # should list SYNTH_OMOP
+```
+
+#### `services/atlas/sql/02_register_source.sql`
+
+```sql
+/**
+ * 02_register_source.sql: tell WebAPI where our CDM lives (Step 9c)
+ *
+ * Run AFTER WebAPI has started once (its Flyway migrations create the
+ * webapi.source and webapi.source_daimon tables this script writes to).
+ * Safe to rerun: inserts only what's missing, and refreshes the connection
+ * string each time (picks up a rotated OHDSI_APP_PASSWORD).
+ *
+ * Concepts
+ *   source  One database WebAPI can query, identified by source_key.
+ *   daimon  Tells WebAPI which SCHEMA plays which ROLE inside that source:
+ *
+ *     daimon_type  meaning      our schema   priority*
+ *     -----------  -----------  -----------  ---------
+ *     0            CDM          cdm          0
+ *     1            Vocabulary   cdm          1
+ *     2            Results      results      1
+ *     5            Temp         temp         0
+ *
+ *   * With several sources, the highest-priority Vocabulary/Results daimon is
+ *     the default Atlas uses for concept search and reports.
+ *
+ * Invocation:
+ *
+ *   docker compose exec -T omop-db sh -c 'psql -v ON_ERROR_STOP=1 \
+ *     -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+ *     -v db_name="$POSTGRES_DB" -v app_pw="$OHDSI_APP_PASSWORD"' \
+ *     < services/atlas/sql/02_register_source.sql
+ *
+ * Then restart WebAPI so it reloads its source list:
+ *   docker compose --profile atlas restart webapi
+ *
+ * @see https://github.com/OHDSI/WebAPI/wiki/CDM-Configuration
+ */
+
+\set source_key  'SYNTH_OMOP'
+\set source_name 'Synthetic Concurrent Disorders (local)'
+
+-- Fail early, with a clear message, if WebAPI hasn't created its tables yet.
+SELECT to_regclass('webapi.source') IS NOT NULL AS webapi_ready
+\gset
+\if :webapi_ready
+\else
+  \echo 'ERROR: webapi.source does not exist yet. Start WebAPI and wait for /WebAPI/info first (Step 9b).'
+  DO $$ BEGIN RAISE EXCEPTION 'WebAPI tables missing'; END $$;
+\endif
+
+BEGIN;
+
+-- ---------------------------------------------------------------------------
+-- The source row. The JDBC URL uses the Compose service name "omop-db" and the
+-- INTERNAL port 5432: WebAPI connects container-to-container, not via the host.
+-- ---------------------------------------------------------------------------
+INSERT INTO webapi.source (source_id, source_name, source_key, source_connection, source_dialect)
+SELECT nextval('webapi.source_sequence'), :'source_name', :'source_key', 'placeholder', 'postgresql'
+ WHERE NOT EXISTS (SELECT 1 FROM webapi.source WHERE source_key = :'source_key');
+
+-- Always (re)write the connection, so a password change only needs a rerun.
+UPDATE webapi.source
+   SET source_name       = :'source_name',
+       source_connection = 'jdbc:postgresql://omop-db:5432/' || :'db_name'
+                           || '?user=ohdsi_app&password=' || :'app_pw'
+ WHERE source_key = :'source_key';
+
+-- ---------------------------------------------------------------------------
+-- The daimons, one row per (source, daimon_type), inserted only if missing.
+-- ---------------------------------------------------------------------------
+INSERT INTO webapi.source_daimon (source_daimon_id, source_id, daimon_type, table_qualifier, priority)
+SELECT nextval('webapi.source_daimon_sequence'), s.source_id, d.daimon_type, d.table_qualifier, d.priority
+  FROM webapi.source s
+ CROSS JOIN (VALUES (0, 'cdm',     0),
+                    (1, 'cdm',     1),
+                    (2, 'results', 1),
+                    (5, 'temp',    0)) AS d(daimon_type, table_qualifier, priority)
+ WHERE s.source_key = :'source_key'
+   AND NOT EXISTS (SELECT 1
+                     FROM webapi.source_daimon sd
+                    WHERE sd.source_id   = s.source_id
+                      AND sd.daimon_type = d.daimon_type);
+
+COMMIT;
+
+-- ---------------------------------------------------------------------------
+-- Show the result (password hidden) so it lands in your terminal scrollback.
+-- ---------------------------------------------------------------------------
+SELECT s.source_id, s.source_key, s.source_name,
+       regexp_replace(s.source_connection, 'password=[^&]*', 'password=***') AS source_connection,
+       sd.daimon_type, sd.table_qualifier, sd.priority
+  FROM webapi.source s
+  JOIN webapi.source_daimon sd USING (source_id)
+ WHERE s.source_key = :'source_key'
+ ORDER BY sd.daimon_type;
+```
+
+### 9d. Create the results tables
+
+Cohort generation and the reports need tables in `results` (cohort, cohort_inclusion, concept_hierarchy and others). WebAPI **generates** the DDL for us, with our schema names filled in and translated to PostgreSQL by SqlRender. We save it, read it, then run it as the admin role.
+
+```bash
+mkdir -p data/atlas
+curl -fsS "http://localhost:8080/WebAPI/ddl/results?dialect=postgresql&schema=results&vocabSchema=cdm&tempSchema=temp&initConceptHierarchy=true" \
+  -o data/atlas/results_ddl.sql
+
+grep -c -i "create table" data/atlas/results_ddl.sql     # sanity check: a non-zero count
+less data/atlas/results_ddl.sql                          # read before you run
+
+docker compose exec -T omop-db sh -c 'psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"' \
+  < data/atlas/results_ddl.sql
+```
+
+- `initConceptHierarchy=true` fills `results.concept_hierarchy` from the full vocabulary. Expect this part to take several minutes.
+- The DDL is written to run **once**. A second run fails with "already exists", which is harmless.
+- `ohdsi_app` gets access to the new tables automatically, through the **default privileges** set in 01.
+
+### 9e. Run Achilles (Data Sources reports)
+
+Without Achilles, cohorts and vocabulary search work, but **Data Sources** is empty and concept search shows no record counts. Achilles fills `results.achilles_*`. Rerun it after **every** ETL load: the counts describe one load.
+
+```bash
+docker compose --profile etl build etl                    # once: adds Achilles to the image
+docker compose --profile etl run --rm etl Rscript /app/run_achilles.R
+docker compose --profile atlas restart webapi             # drop cached (empty) reports
+```
+
+Record how long it took in `docs/run-log.md`.
+
+#### `services/etl/run_achilles.R`
+
+```r
+#' run_achilles.R: characterize the loaded CDM for Atlas's "Data Sources" pages (Step 9e)
+#'
+#' Achilles counts things (people per year of birth, conditions per concept,
+#' observation-period lengths …) and writes the counts to results.achilles_*.
+#' Atlas reads those tables to draw its Data Sources reports and to show
+#' record counts next to concepts in search results.
+#'
+#' Run it after every ETL load (the counts describe ONE load), as the admin role
+#' (it creates tables in results; 01_roles_and_schemas.sql's default privileges
+#' then give ohdsi_app access to them automatically).
+#'
+#' Usage (needs the etl image rebuilt with Achilles, see the Dockerfile):
+#'   docker compose --profile etl run --rm etl Rscript /app/run_achilles.R
+#'
+#' Env vars (already set on the etl service in compose.yaml):
+#'   DB_SERVER, DB_PORT, DB_USER, DB_PASSWORD, RUN_ID
+#'
+#' @see https://ohdsi.github.io/Achilles/
+#' @see https://github.com/OHDSI/WebAPI/wiki/CDM-Configuration
+
+library(DatabaseConnector)
+library(Achilles)
+
+# --- Configuration ----------------------------------------------------------
+cdm_schema     <- "cdm"
+vocab_schema   <- "cdm"       # our vocabulary lives alongside the CDM tables
+results_schema <- "results"
+run_id         <- Sys.getenv("RUN_ID")
+
+stopifnot(nzchar(run_id))
+
+#' Same connection pattern as run_etl.R (DRY candidate: move to a shared
+#' services/etl/connection.R and source() it from both scripts).
+cd <- createConnectionDetails(
+  dbms         = "postgresql",
+  server       = Sys.getenv("DB_SERVER"),
+  port         = as.integer(Sys.getenv("DB_PORT", "5432")),
+  user         = Sys.getenv("DB_USER"),
+  password     = Sys.getenv("DB_PASSWORD"),
+  pathToDriver = Sys.getenv("DATABASECONNECTOR_JAR_FOLDER", "/opt/jdbc")
+)
+
+# Achilles creates outputFolder with a NON-recursive dir.create(), so a missing
+# parent (/tmp/achilles-output) makes it fail, and it only crashes at the very
+# end, when it reads its own log back to merge the scratch tables. Create the
+# whole path ourselves first.
+output_folder <- file.path("/tmp/achilles-output", run_id)
+dir.create(output_folder, recursive = TRUE, showWarnings = FALSE)
+stopifnot(dir.exists(output_folder))
+
+message(sprintf("[achilles] run %s: characterizing %s → %s", run_id, cdm_schema, results_schema))
+started <- Sys.time()
+
+Achilles::achilles(
+  connectionDetails       = cd,
+  cdmDatabaseSchema       = cdm_schema,
+  resultsDatabaseSchema   = results_schema,
+  vocabDatabaseSchema     = vocab_schema,
+  sourceName              = paste0("Synthetic Concurrent Disorders (", run_id, ")"),
+  cdmVersion              = "5.4",
+  createTable             = TRUE,    # drop and recreate achilles_* (fresh counts per load)
+  smallCellCount          = 5,       # counts below this are suppressed, the habit to keep for real data
+  numThreads              = 1,       # PostgreSQL + 1 thread is the simplest, most predictable setting
+  optimizeAtlasCache      = TRUE,    # builds results.achilles_result_concept_count for Atlas search
+  outputFolder            = output_folder
+)
+
+message(sprintf("[achilles] done in %.1f minutes",
+                as.numeric(difftime(Sys.time(), started, units = "mins"))))
+message("[achilles] restart WebAPI so Atlas drops its cached (empty) reports:")
+message("           docker compose --profile atlas restart webapi")
+```
+
+### 9f. Open Atlas and check it
+
+Open **<http://localhost:8080/atlas/>**.
+
+| Check | Where in Atlas | Expected |
+|---|---|---|
+| WebAPI reachable | Home page | No "Unable to connect to an instance of the WebAPI" banner |
+| Source registered | **Configuration** | `SYNTH_OMOP` listed with CDM, Vocabulary, Results and Temp |
+| Vocabulary works | **Search** → `depressive disorder` | Concepts listed; RC / DRC counts appear after 9e |
+| Achilles loaded | **Data Sources** → `SYNTH_OMOP` → Dashboard | Person count = `SELECT COUNT(*) FROM cdm.person` |
+| Cohorts generate | Smoke-test cohort, below | Count matches the SQL count |
+
+**Smoke-test cohort (reconciliation again; see Lesson 005).** In Atlas, build a concept set from your MHD diagnosis's **standard** concept with *Include descendants* ticked. Make a cohort definition whose entry event is a *Condition occurrence* of that set, then **Generate** it on `SYNTH_OMOP`. Compare the person count with SQL:
+
+```sql
+-- Replace 0 with the standard concept_id you used in the Atlas concept set.
+SELECT COUNT(DISTINCT co.person_id) AS persons
+  FROM cdm.condition_occurrence co
+  JOIN cdm.concept_ancestor ca ON ca.descendant_concept_id = co.condition_concept_id
+ WHERE ca.ancestor_concept_id = 0;
+```
+
+They should match, or Atlas should be slightly *lower*: by default, Atlas counts only events that fall **inside an observation period**. If they differ, explain the difference before trusting either number.
+
+> **Keep your work.** Atlas definitions live in the `webapi` schema, inside `omop-pgdata`. `docker compose down -v` deletes them along with the CDM. Export important cohort definitions as JSON (cohort → **Export** tab) into the repo, e.g. `docs/cohorts/`.
+
+### 9g. Alternative: full Broadsea
+
+**OHDSI Broadsea** (<https://github.com/OHDSI/Broadsea>) is the community's full Docker deployment: Atlas, WebAPI, HADES/RStudio, Solr vocabulary search, Ares, security providers (basic, LDAP, AD), Traefik and HTTPS. Move to it when you need a shared, logged-in server rather than a single-user laptop stack. Keep it in its own folder, **pin a tagged release**, and register `omop-db` with the same source and daimon layout as 9c. Since Broadsea 3.5, passwords live in files under `./secrets` (Docker secrets), not in `.env`.
 
 ---
 
@@ -1639,12 +2256,24 @@ Networking: put both stacks on a shared Docker network, or point Broadsea at `ho
 - [ ] `validate_joint.sql` results attached to the run-log row
 - [ ] Same run repeated with the same seed produces identical CSV hashes
 
+**If you run Atlas (Step 9):**
+
+- [ ] `OHDSI_APP_PASSWORD` generated (`openssl rand -hex 24`), not the example value; `01_roles_and_schemas.sql` finished without errors
+- [ ] `/WebAPI/info` reports `2.15.1`; Atlas and WebAPI on the same minor version
+- [ ] Source `SYNTH_OMOP` has 4 daimons: cdm / cdm / results / temp
+- [ ] Results DDL saved in `data/atlas/` and applied once
+- [ ] Achilles rerun after **every** ETL load, then WebAPI restarted
+- [ ] Smoke-test cohort count reconciles with the SQL count (9f)
+- [ ] Ports bound to `127.0.0.1` only (security is disabled in this setup)
+
 ### For the analyst using the database (non-admin)
 
 - [ ] I've read `cdm.cdm_source.source_description` and `docs/assumptions.md`
 - [ ] I understand MHD/SUD come from **survey definitions**, and that specific diagnosis codes are **assumptions**
 - [ ] I'm using this for testing, cohort development, education, or methods work, **not** effect estimates
 - [ ] I know which `RUN_ID` my analysis used, and I've cited it
+- [ ] In Atlas, I've checked which run the `SYNTH_OMOP` source currently holds (Data Sources dashboard, or `cdm.cdm_source`)
+- [ ] I export cohort definitions I want to keep as JSON. This Atlas has no logins, and a database reset deletes everything in it
 
 ---
 
@@ -1672,13 +2301,27 @@ Networking: put both stacks on a shared Docker network, or point Broadsea at `ho
 | `LoadVocabFromCsv` warns "Found and resolved improper quoting … `"y set" tubing`" | One HCPCS concept name (`A4719`, concept 2614984) starts with a double quote; `fread` detects and heals it | Harmless. Confirm with `wc -l CONCEPT.csv` (minus header) = `SELECT COUNT(*) FROM cdm.concept` |
 | `LoadVocabFromCsv` warns "`type_convert()` only converts columns of type 'character'" | A small table with no text columns | Harmless; ignore |
 | `LoadVocabFromCsv` errors on unexpected files | Zip, jar, `CONCEPT_CPT4.csv` or `*_METADATA.csv` left in `data/vocab/athena/` | Move them to `athena-extras/` (Step 3b) |
+| Atlas: "Unable to connect to an instance of the WebAPI" | WebAPI is still running Flyway on first start, or `WEBAPI_URL` isn't reachable *from the browser* | Wait for `curl http://localhost:8080/WebAPI/info`; `WEBAPI_URL` must use `localhost` and end in `/WebAPI/`; hard-refresh the page |
+| WebAPI log: `password authentication failed for user "ohdsi_app"` | `omop-db` wasn't recreated after adding the variable, or 01 hasn't run since the password changed | `docker compose up -d omop-db`, rerun 01 (and 02), then `docker compose --profile atlas restart webapi` |
+| Flyway: `Found non-empty schema(s) "webapi" without schema history table` | Something else created tables in `webapi` | If nothing in it is worth keeping: `DROP SCHEMA webapi CASCADE;`, rerun 01, restart WebAPI |
+| `01_roles_and_schemas.sql` says the password is **0 characters**, even after `up -d` | Compose isn't passing the variable to `omop-db`: `.env` lacks it, or your `compose.yaml` lacks `OHDSI_APP_PASSWORD: ${OHDSI_APP_PASSWORD:-}` under `omop-db` → `environment:`. The `:-` default turns a missing value into a silent empty string | `docker compose config \| grep OHDSI_APP_PASSWORD` must show a value; fix `.env` or `compose.yaml`, then `docker compose up -d omop-db` (should say **Recreated**) |
+| `01_roles_and_schemas.sql` stops with "not URL-safe" | The password has characters that would break the JDBC URL | Use `openssl rand -hex 24` |
+| `http://localhost:8080/atlas/` returns 404 | This Atlas image version serves from `/` instead of `/atlas/` | In `nginx.conf`, change to `proxy_pass http://atlas:8080/;` (the trailing slash strips the prefix), then `docker compose --profile atlas restart atlas-proxy` |
+| `SYNTH_OMOP` missing in Atlas after 9c | WebAPI caches sources at startup | `docker compose --profile atlas restart webapi`, or Atlas **Configuration** → *Clear Configuration Cache* |
+| `Error in library(Achilles) : there is no package called 'Achilles'` after a "successful" build | `R -e "install..."` exits 0 even when the install fails, so the image built without it | Use the Dockerfile's `requireNamespace()` check; rebuild with `--progress=plain` and read the real error |
+| Data Sources shows **"Error loading report"** (Person, Procedure …), or is empty; search shows no RC/DRC counts | Achilles hasn't run (`results.achilles_*` missing), or hasn't run since the last load. The static `/atlas/…` requests in DevTools are fine (304 = cached); the failing one is a `/WebAPI/cdmresults/…` call returning 500 | Check `SELECT to_regclass('results.achilles_results');` (null = never ran). Run Step 9e, restart WebAPI, hard-refresh. Still failing? Read `docker compose --profile atlas logs webapi` |
+| Cohort generation fails: `permission denied for schema results` / `temp` | Grants missing (e.g. after a `down -v` and reload) | Rerun 01; it's idempotent |
+| Results DDL rerun: `relation … already exists` | The DDL is meant to run once | Harmless; skip it |
+| Port 8080 already in use | Another local service | Set `ATLAS_PORT=8090` in `.env`; `WEBAPI_URL` and `SECURITY_ORIGIN` follow it automatically. Use the new port in the `curl` commands |
 
 ---
 
 ## Security and usability suggestions
 
 - **Secrets.** Move `OMOP_DB_PASSWORD` to Docker Compose `secrets:` (a file-based secret) once more than one person uses this. Postgres images support `POSTGRES_PASSWORD_FILE`.
-- **Least privilege.** Create a read-only `omop_reader` role for analysts and Atlas, and keep `omop_admin` for the ETL only.
+- **Least privilege.** Done for Atlas: WebAPI runs as `ohdsi_app`, which can only read `cdm` (Step 9b). Still to do: a read-only `omop_reader` role for analysts' direct SQL, keeping `omop_admin` for the ETL only.
+- **Atlas has no login in this setup** (`SECURITY_PROVIDER: DisabledSecurity`). That's acceptable for synthetic data on `127.0.0.1`, and not acceptable for anything shared or containing real data. Before others use it, move to Broadsea (9g) with a security provider and HTTPS.
+- **The `ohdsi_app` password is stored in plain text** in `webapi.source.source_connection`, because that's how WebAPI 2.x connects to sources. It's one more reason that role can't write clinical data. Rotate it by changing `.env`, then rerunning 01 and 02.
 - **Pin everything.** Pin image digests (`postgres:16@sha256:…`), the ETL-Synthea commit SHA, and the Broadsea tag. "Latest" makes reproducibility impossible.
 - **Localhost binding** is already set. Keep it unless there's a reviewed need to change it.
 - **DRY.** The age bands appear in `config.json`, the module and `validate_joint.sql`. Make `config.json` the single source and render the other two from it.
@@ -1697,6 +2340,9 @@ Lessons and lectures can be found in the [`lessons/`](lessons/) folder, complete
 | [003: OMOP Concepts](lessons/003_omop-concepts.md) | Concepts, standard vs non-standard, domains, `Maps to`, hierarchies, deprecation, `concept_id = 0` |
 | [004: Pipeline Deep Dive](lessons/004_pipeline-deep-dive.md) | NSDUH design and limits (AMI as a model), Synthea modules, Athena bundles, ETL-Synthea stages and filters, provenance |
 | [005: Where Did 18 Deaths Go?](lessons/005_where-did-18-deaths-go.md) | Case study: reconciling counts through the ETL, six failure modes, responsible patching, writing it up |
+| [006: Introduction to ATLAS](lessons/006_intro-to-atlas.md) | What ATLAS is for, its three parts, concept sets, cohorts and eras, a tour of the menu, pre-computed vs on-demand results |
+| [007: ATLAS Deep Dive](lessons/007_atlas-deep-dive.md) | Cohort logic (entry, inclusion, exit, eras), attrition reports, JSON → SQL via Circe, characterization, incidence, pathways, phenotype evaluation |
+| [008: Our ATLAS Setup and the UI](lessons/008_our-atlas-setup-and-the-ui.md) | Our stack end to end, WebAPI's two database jobs, following a click to a table, caches, real setup failures by layer, backups |
 
 Further reading:
 
@@ -1718,3 +2364,7 @@ Further reading:
 - ETL-Synthea: <https://github.com/OHDSI/ETL-Synthea> · docs: <https://ohdsi.github.io/ETL-Synthea/>
 - Data Quality Dashboard: <https://ohdsi.github.io/DataQualityDashboard/>
 - Broadsea: <https://github.com/OHDSI/Broadsea>
+- WebAPI: <https://github.com/OHDSI/WebAPI> · CDM configuration (sources, daimons, results DDL): <https://github.com/OHDSI/WebAPI/wiki/CDM-Configuration>
+- Atlas: <https://github.com/OHDSI/Atlas> · wiki: <https://github.com/OHDSI/Atlas/wiki>
+- Achilles: <https://ohdsi.github.io/Achilles/>
+- Atlas 3.0 preview (July 2026): <https://www.ohdsi.org/wp-content/uploads/2026/07/ATLAS-3.0-Preview.pdf>
