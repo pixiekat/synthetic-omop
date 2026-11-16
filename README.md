@@ -7,7 +7,7 @@
 | **Status** | **Pilot run end to end** (`pilot-0001`, 2026-11-11): Synthea → ETL-Synthea → OMOP 5.4 loaded and checked. Calibration still uses **placeholder** probabilities; real NSDUH estimates are the next milestone. |
 | **Audience** | Engineers who build the pipeline (admin) and analysts who use the resulting database (non-admin) |
 | **Pinned versions** | Synthea `v3.3.0`, OMOP CDM `5.4`, ETL-Synthea (`OHDSI/ETL-Synthea`, pinned to a commit), PostgreSQL `16`, Athena vocabulary `v5.0 29-AUG-26`, WebAPI `2.15.1` + Atlas `2.15.0` (optional, Step 9) |
-| **Atlas status** | Step 9 is **new and not yet run end to end**. The setup SQL was tested on PostgreSQL 16 with mock WebAPI tables; the containers haven't been started yet. Record the first run in `docs/run-log.md`. |
+| **Atlas status** | **Running on the pilot machine** (2026-11-16): WebAPI 2.15.1 + Atlas 2.15.0, source `SYNTH_OMOP` registered, Achilles loaded (30,747 `achilles_results` rows), Data Sources reports working. Still to do: the 9f cohort smoke test. |
 | **Source notes** | Builds on the OMOP project's planning notes. The method is unchanged; this guide adds the local Docker setup. |
 | **Lessons** | Teaching material for this pipeline lives in [`lessons/`](lessons/) (see [Further learning](#further-learning)). |
 
@@ -161,7 +161,8 @@ synthetic-omop/
         └── sql/
             ├── validate_joint.sql               # Compares OMOP joint counts to targets
             ├── patch_missing_deaths.sql         # Restores deaths the standard ETL drops (Step 7b)
-            └── patch_missing_immunizations.sql  # Restores immunizations the standard ETL drops (Step 7c)
+            ├── patch_missing_immunizations.sql  # Restores immunizations the standard ETL drops (Step 7c)
+            └── patch_race_concepts.sql          # Maps native/hawaiian race (A-009); run only after review
 ```
 
 ---
@@ -1075,6 +1076,7 @@ Every simulation choice and every deviation from the standard ETL gets an ID, so
 | A-006 | SNOMED `55680006` "Drug overdose" was retired in 2021 and has no `Maps to`; candidates 607147 "Overdose" / 4053782 "Overdose of opiate" | `cdm.death`, `cdm.condition_occurrence` | Unmapped (`0`) pending terminology review |
 | A-007 | SNOMED `94260004` maps to Cancer Modifier 35226112 (Measurement domain), which needs the Cancer Modifier vocabulary | Athena bundle (Step 3b); `cdm.death` via patch | Mapping resolved by adding Cancer Modifier; deaths still restored by the patch (ETL accepts Condition-domain causes only) |
 | A-008 | Immunizations dropped by ETL-Synthea (single-digit CVX codes `3`/`8` vs `03`/`08`; COVID `207`/`208` mapping outside CVX) are restored, with unmappable codes kept as `0` | `services/etl/sql/patch_missing_immunizations.sql` | Applied after every ETL |
+| A-009 | ETL-Synthea maps only `white`/`black`/`asian` race. pilot-0001: 30 of 1,175 persons at `0` (`native` 13, `other` 9, `hawaiian` 8). Proposed: `native` → 8657 American Indian or Alaska Native, `hawaiian` → 8557 Native Hawaiian or Other Pacific Islander (OMB categories; both standard and valid in the loaded vocabulary). `other` stays `0`: its only candidate, 8522 Other Race, is retired | `cdm.person`; `services/etl/sql/patch_race_concepts.sql` (tested, **not applied**) | Pending terminology review; affects race-stratified results for the smallest groups |
 ```
 
 ### `services/synthea/keep/keep_concurrent.json` (optional)
@@ -2296,6 +2298,7 @@ They should match, or Atlas should be slightly *lower*: by default, Atlas counts
 | Immunizations missing from `drug_exposure`, yet "0 unmapped" | CVX isn't in the vocabulary bundle, so the ETL drops immunizations instead of mapping them to `0` | Add **CVX** in Athena (Step 3b), reload, then rerun the 7a reconciliation queries |
 | A few immunization codes still missing *with* CVX loaded | Single-digit codes (`3` vs `03`) or codes that map outside CVX (e.g. COVID `207`/`208`) | Step 7c: run `patch_missing_immunizations.sql` |
 | `cdm.death` has fewer rows than deceased patients | `insert_death.sql` inner-joins the cause and keeps only Condition-domain causes: it drops deaths with no death-cert encounter, an unmapped cause, or a cause mapping to another domain | Step 7b: diagnose, then run `patch_missing_deaths.sql` |
+| Atlas Person report shows a **"No matching concept"** slice under Race | ETL-Synthea maps only `white`/`black`/`asian`; `native`, `hawaiian` and `other` get `race_concept_id = 0` | Expected for now (A-009). `SELECT race_source_value, race_concept_id, COUNT(*) FROM cdm.person GROUP BY 1, 2;`. After review: `patch_race_concepts.sql`, then rerun Achilles and restart WebAPI |
 | A concept has `Maps to value` but no `Maps to` | Its `Maps to` target is in a vocabulary you didn't download (e.g. Cancer Modifier) | Check the concept on athena.ohdsi.org; add that vocabulary to the bundle and reload |
 | Common Synthea codes map to `0` | Synthea uses some SNOMED codes **retired** after it was written (`invalid_reason = 'D'`) | Expected. List them with 7a query 4 and record each in `docs/assumptions.md`; any mapping is a terminology-review decision |
 | `LoadVocabFromCsv` warns "Found and resolved improper quoting … `"y set" tubing`" | One HCPCS concept name (`A4719`, concept 2614984) starts with a double quote; `fread` detects and heals it | Harmless. Confirm with `wc -l CONCEPT.csv` (minus header) = `SELECT COUNT(*) FROM cdm.concept` |
