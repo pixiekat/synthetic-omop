@@ -8,6 +8,7 @@
 | **Audience** | Engineers who build the pipeline (admin) and analysts who use the resulting database (non-admin) |
 | **Pinned versions** | Synthea `v3.3.0`, OMOP CDM `5.4`, ETL-Synthea (`OHDSI/ETL-Synthea`, pinned to a commit), PostgreSQL `16`, Athena vocabulary `v5.0 29-AUG-26`, WebAPI `2.15.1` + Atlas `2.15.0` (optional, Step 9) |
 | **Atlas status** | **Running on the pilot machine** (2026-11-16): WebAPI 2.15.1 + Atlas 2.15.0, source `SYNTH_OMOP` registered, Achilles loaded (30,747 `achilles_results` rows), Data Sources reports working. Still to do: the 9f cohort smoke test. |
+| **Analyses status** | Step 10 (TreatmentPatterns, CohortContrast) is **new and not yet run**. Next: Comorbidity4j, then PatientExploreR (trial run) |
 | **Source notes** | Builds on the OMOP project's planning notes. The method is unchanged; this guide adds the local Docker setup. |
 | **Lessons** | Teaching material for this pipeline lives in [`lessons/`](lessons/) (see [Further learning](#further-learning)). |
 
@@ -38,10 +39,19 @@
     - [9e. Run Achilles (Data Sources reports)](#9e-run-achilles-data-sources-reports)
     - [9f. Open Atlas and check it](#9f-open-atlas-and-check-it)
     - [9g. Alternative: full Broadsea](#9g-alternative-full-broadsea)
-13. [QA checklist](#qa-checklist)
-14. [Troubleshooting](#troubleshooting)
-15. [Security and usability suggestions](#security-and-usability-suggestions)
-16. [Further learning](#further-learning)
+13. [Step 10 (optional): Cohort analyses: TreatmentPatterns and CohortContrast](#step-10-optional-cohort-analyses-treatmentpatterns-and-cohortcontrast)
+    - [10a. How it fits](#10a-how-it-fits)
+    - [10b. Prepare (once)](#10b-prepare-once)
+    - [10c. Define and generate the cohorts in ATLAS](#10c-define-and-generate-the-cohorts-in-atlas)
+    - [10d. Study files](#10d-study-files)
+    - [10e. Run TreatmentPatterns](#10e-run-treatmentpatterns)
+    - [10f. Run CohortContrast](#10f-run-cohortcontrast)
+    - [10g. The CohortContrast viewer (to finish after the first run)](#10g-the-cohortcontrast-viewer-to-finish-after-the-first-run)
+    - [10h. Shared helpers](#10h-shared-helpers)
+14. [QA checklist](#qa-checklist)
+15. [Troubleshooting](#troubleshooting)
+16. [Security and usability suggestions](#security-and-usability-suggestions)
+17. [Further learning](#further-learning)
 
 ---
 
@@ -115,7 +125,10 @@ synthetic-omop/
 │   ├── 005_where-did-18-deaths-go.md
 │   ├── 006_intro-to-atlas.md
 │   ├── 007_atlas-deep-dive.md
-│   └── 008_our-atlas-setup-and-the-ui.md
+│   ├── 008_our-atlas-setup-and-the-ui.md
+│   ├── 009_synthea-to-cdm-internals.md
+│   ├── 010_athena-and-the-vocabularies.md
+│   └── 011_cohort-analytics.md
 │
 ├── backups/                       # ⚠ gitignored. pg_dump files of loaded databases (Step 7d)
 │
@@ -125,6 +138,7 @@ synthetic-omop/
 │   ├── vocab/
 │   │   ├── athena/                # The 10 OMOP vocabulary CSVs ONLY (the ETL reads this folder)
 │   │   └── athena-extras/         # Original zip, CPT4 tool, *_METADATA files (kept out of the ETL's way)
+│   ├── analyses/                  # Step 10 results: <RUN_ID>/<tool>/<study>/ (gitignored with data/)
 │   ├── atlas/                     # Generated results DDL from WebAPI (Step 9d), kept for provenance
 │   ├── calibration/               # Output of Step 4 (joint_probabilities.json)
 │   ├── synthea-output/
@@ -135,6 +149,13 @@ synthetic-omop/
     ├── postgres/
     │   └── initdb/
     │       └── 01_schemas.sql     # Creates synthea / cdm / results schemas
+    ├── analytics/                 # Optional cohort analyses (Step 10)
+    │   ├── Dockerfile             # R + TreatmentPatterns + CohortContrast (dated package snapshot)
+    │   ├── R/common.R             # Shared helpers: config, connections, cohort checks, provenance
+    │   ├── run_treatment_patterns.R
+    │   ├── run_cohort_contrast.R
+    │   ├── sql/01_analytics_scratch.sql   # Throwaway write schema, owned by ohdsi_app
+    │   └── studies/               # One committed .env per analysis (cohort IDs + settings)
     ├── atlas/                     # Optional OHDSI web stack (Step 9)
     │   ├── nginx.conf             # One front door: /atlas → Atlas, /WebAPI → WebAPI
     │   └── sql/
@@ -289,6 +310,7 @@ Services sit behind **profiles**, so the plain `docker compose up` starts only t
 #   generate    → run Synthea with our module (Step 6)
 #   etl         → load Synthea CSV + Athena vocab into OMOP (Step 7)
 #   atlas       → OHDSI WebAPI + Atlas + proxy, optional (Step 9)
+#   analytics   → TreatmentPatterns, CohortContrast, optional (Step 10)
 #
 # Usage:
 #   docker compose up -d                                   # database
@@ -296,6 +318,7 @@ Services sit behind **profiles**, so the plain `docker compose up` starts only t
 #   docker compose --profile generate  run --rm synthea
 #   docker compose --profile etl       run --rm etl
 #   docker compose --profile atlas     up -d               # long-running web stack
+#   docker compose --profile analytics run --rm -e STUDY=<name> analytics Rscript /app/run_<tool>.R
 # =============================================================================
 name: synthetic-omop
 
@@ -490,6 +513,38 @@ services:
       - "127.0.0.1:${ATLAS_PORT:-8080}:8080"
     volumes:
       - ./services/atlas/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+
+  # ===========================================================================
+  # Optional analyses (Step 10). Nothing below starts without
+  # `--profile analytics`. One-shot runs, like etl.
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # analytics: R image with TreatmentPatterns and CohortContrast.
+  # Connects as the least-privilege ohdsi_app role (reads cdm + results.cohort,
+  # writes only results and analytics_scratch). Which cohorts and settings to
+  # use come from a committed study file: -e STUDY=<name>.
+  # ---------------------------------------------------------------------------
+  analytics:
+    profiles: ["analytics"]
+    build: ./services/analytics
+    depends_on:
+      omop-db:
+        condition: service_healthy
+    # Your host user, so results in ./data/analyses belong to you.
+    user: "${LOCAL_UID}:${LOCAL_GID}"
+    environment:
+      HOME: /tmp
+      RUN_ID: ${RUN_ID}
+      DB_HOST: omop-db                         # DBI/RPostgres form (CDMConnector)
+      DB_NAME: ${OMOP_DB_NAME}
+      DB_SERVER: omop-db/${OMOP_DB_NAME}       # DatabaseConnector "host/dbname" form
+      DB_PORT: "5432"                          # internal port, not the host port
+      DB_USER: ohdsi_app
+      DB_PASSWORD: ${OHDSI_APP_PASSWORD}
+    volumes:
+      - ./services/analytics:/app:ro           # scripts, helpers and study files
+      - ./data/analyses:/data/analyses         # results, per RUN_ID
 
 volumes:
   omop-pgdata:
@@ -2237,6 +2292,804 @@ They should match, or Atlas should be slightly *lower*: by default, Atlas counts
 
 ---
 
+## Step 10 (optional): Cohort analyses: TreatmentPatterns and CohortContrast
+
+Step 9 gave you ATLAS for **defining** cohorts. This step adds two R packages that **analyse** them:
+
+| Package | Question it answers | Maintainer |
+|---|---|---|
+| **TreatmentPatterns** | After entering a cohort, which treatments do people go through, in what order and combinations? (sunburst and Sankey) | DARWIN EU / Erasmus MC, CRAN |
+| **CohortContrast** | Which concepts are over-represented in a target cohort compared with a control? (enrichment) | University of Tartu, CRAN |
+
+> **Status:** new, and **not yet run end to end**. The SQL was tested on PostgreSQL 16, and the
+> Compose service resolves cleanly. The R scripts follow each package's documented API, but
+> haven't run against these package versions yet. Record the first run in `docs/run-log.md`.
+
+### 10a. How it fits
+
+```
+ ATLAS (Step 9): define cohorts → Generate on SYNTH_OMOP
+        │
+        ▼
+ results.cohort          ← the hand-off point: every tool reads cohorts from here, by ID
+        │
+        ├──▶ analytics: run_treatment_patterns.R ──▶ data/analyses/<RUN_ID>/treatment-patterns/<study>/
+        └──▶ analytics: run_cohort_contrast.R    ──▶ data/analyses/<RUN_ID>/cohort-contrast/<study>/
+```
+
+Design choices, and why:
+
+| Choice | Why |
+|---|---|
+| **ATLAS is the cohort hub** | Every tool uses the same reviewed definitions. No cohort logic is duplicated in R |
+| **A separate `analytics` image** | The ETL image stays pinned and lean; upgrading an analysis package can't break a load |
+| **A dated package snapshot** (`CRAN_SNAPSHOT`) | Pre-built binaries (fast), and the same versions on every rebuild |
+| **Connects as `ohdsi_app`** | Least privilege: reads `cdm`, can't change it |
+| **`analytics_scratch` schema** | CohortContrast's write schema is described as temporary, so it's kept away from WebAPI's `temp` |
+| **Committed study files** | Each analysis is a reviewable file: cohort IDs plus settings (`services/analytics/studies/`) |
+| **`provenance.json` per result** | What ran, on which load, with which package versions and settings |
+
+### 10b. Prepare (once)
+
+```bash
+# 1. Scratch schema (needs Step 9b's ohdsi_app role)
+docker compose exec -T omop-db sh -c 'psql -v ON_ERROR_STOP=1 \
+  -U "$POSTGRES_USER" -d "$POSTGRES_DB"' < services/analytics/sql/01_analytics_scratch.sql
+
+# 2. Results folder, owned by you (the container runs as your user)
+mkdir -p data/analyses
+
+# 3. Build the image, keeping the log (minutes with binaries; much longer if anything compiles)
+docker compose --profile analytics build --progress=plain analytics 2>&1 | tee /tmp/analytics-build.log
+
+# 4. Prove the packages load (the Dockerfile also checks this)
+docker compose --profile analytics run --rm analytics Rscript -e \
+  "for (p in c('TreatmentPatterns','CohortContrast','CDMConnector')) cat(p, as.character(packageVersion(p)), '\n')"
+```
+
+#### `services/analytics/Dockerfile`
+
+```dockerfile
+# =============================================================================
+# services/analytics/Dockerfile: R image for cohort-level analyses (Step 10)
+#
+# Kept SEPARATE from services/etl on purpose: the ETL image stays pinned and
+# lean, and upgrading an analysis package can never break a data load.
+#
+# Packages:
+#   TreatmentPatterns  treatment pathways (sunburst / Sankey)    DARWIN EU, CRAN
+#   CohortContrast     concept enrichment, target vs control      Univ. Tartu, CRAN
+#
+# Same R version as the etl image, so Docker can share the base layers.
+# =============================================================================
+FROM rocker/r-ver:4.4.2
+
+# System dependencies:
+#   default-jdk                  DatabaseConnector (JDBC), used by TreatmentPatterns
+#   libpq-dev                    RPostgres (DBI driver), used by CDMConnector / CohortContrast
+#   libxml2/libssl/libcurl -dev  common build dependencies for R packages
+#   python3 + venv + pip         CohortContrast's results viewer uses Python helpers (Step 10g)
+#   libglpk-dev libgmp-dev       igraph (needed by networkD3, the Sankey plots): the pre-built
+#                                binary installs without them but then FAILS TO LOAD
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      default-jdk libpq-dev libxml2-dev libssl-dev libcurl4-openssl-dev \
+      libglpk-dev libgmp-dev \
+      python3 python3-venv python3-pip \
+  && R CMD javareconf \
+  && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
+# Package source: a DATED snapshot of Posit Package Manager, Linux binaries.
+#   - Binaries: arrow and duckdb install in seconds instead of compiling for
+#     many minutes.
+#   - Dated: rebuilding next month installs exactly the same versions
+#     (reproducibility, like pinning ETL_SYNTHEA_REF). Bump it deliberately.
+# The rocker base image already sets the HTTP user agent PPM needs to serve
+# binaries; this line only replaces the repository URL. Its pre-set snapshot
+# is from when R 4.4.2 was current, too old for these packages.
+# ---------------------------------------------------------------------------
+ARG CRAN_SNAPSHOT=2026-11-16
+RUN . /etc/os-release \
+  && printf "options(repos = c(CRAN = 'https://p3m.dev/cran/__linux__/%s/%s'))\n" \
+       "$VERSION_CODENAME" "$CRAN_SNAPSHOT" >> /usr/local/lib/R/etc/Rprofile.site
+
+# Install, then CHECK. `R -e "install.packages(...)"` exits 0 even when an
+# install fails (Lesson 008, case 2), so the last command turns a missing
+# package into a failed build. It prints each failure's actual LOAD error,
+# because "installed but won't load" usually means a missing system library,
+# and the error message names it.
+RUN R -q -e "install.packages(c( \
+      'DatabaseConnector', 'SqlRender', 'DBI', 'RPostgres', 'CDMConnector', \
+      'TreatmentPatterns', 'CohortContrast', \
+      'jsonlite', 'htmlwidgets', 'sunburstR', 'networkD3', 'plotly'))" \
+  && R -q -e "pkgs <- c('DatabaseConnector','SqlRender','DBI','RPostgres','CDMConnector', \
+                        'TreatmentPatterns','CohortContrast','jsonlite','htmlwidgets', \
+                        'sunburstR','networkD3','plotly'); \
+              errs <- vapply(pkgs, function(p) tryCatch({ loadNamespace(p); '' }, \
+                             error = function(e) conditionMessage(e)), character(1)); \
+              bad <- errs[nzchar(errs)]; \
+              for (p in names(bad)) message('CANNOT LOAD ', p, ': ', bad[[p]]); \
+              if (length(bad)) quit(status = 1)"
+
+# PostgreSQL JDBC driver at BUILD time, so runs work offline (same as etl).
+ENV DATABASECONNECTOR_JAR_FOLDER=/opt/jdbc
+RUN mkdir -p /opt/jdbc \
+  && R -q -e "DatabaseConnector::downloadJdbcDrivers('postgresql', pathToDriver = '/opt/jdbc')"
+
+# Unprivileged user LAST: everything above needed root to install.
+RUN useradd --create-home analytics
+USER analytics
+WORKDIR /app
+
+# No default analysis: you always say which script and which study to run.
+CMD ["Rscript", "-e", "cat('Usage: docker compose --profile analytics run --rm -e STUDY=<name> analytics Rscript /app/run_<tool>.R\\n')"]
+```
+
+#### `services/analytics/sql/01_analytics_scratch.sql`
+
+```sql
+/**
+ * 01_analytics_scratch.sql: scratch schema for analysis packages (Step 10b)
+ *
+ * Run once, as the admin role, AFTER services/atlas/sql/01_roles_and_schemas.sql
+ * (which creates the ohdsi_app role). Safe to rerun.
+ *
+ * Why a separate schema?
+ *   CohortContrast (via CDMConnector) needs a "write schema" for intermediate
+ *   tables, and its docs describe that schema as temporary ("will be
+ *   deleted"). So it gets its own throwaway schema. It must never be WebAPI's
+ *   temp schema, and never cdm or results. Emptying or dropping it can't
+ *   hurt anything else.
+ *
+ * Invocation:
+ *   docker compose exec -T omop-db sh -c 'psql -v ON_ERROR_STOP=1 \
+ *     -U "$POSTGRES_USER" -d "$POSTGRES_DB"' < services/analytics/sql/01_analytics_scratch.sql
+ */
+
+-- Fail clearly if Step 9b hasn't been run yet.
+SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ohdsi_app') AS have_role
+\gset
+\if :have_role
+\else
+  \echo 'ERROR: role ohdsi_app does not exist. Run services/atlas/sql/01_roles_and_schemas.sql first (Step 9b).'
+  DO $$ BEGIN RAISE EXCEPTION 'ohdsi_app missing'; END $$;
+\endif
+
+CREATE SCHEMA IF NOT EXISTS analytics_scratch AUTHORIZATION ohdsi_app;
+ALTER SCHEMA analytics_scratch OWNER TO ohdsi_app;
+
+-- The analyses read ATLAS cohort NAMES from webapi.cohort_definition.
+-- ohdsi_app already owns the webapi schema, so no extra grant is needed;
+-- this check just makes that assumption visible.
+SELECT has_schema_privilege('ohdsi_app', 'webapi', 'USAGE')  AS can_read_webapi,
+       has_schema_privilege('ohdsi_app', 'cdm', 'USAGE')     AS can_read_cdm,
+       has_schema_privilege('ohdsi_app', 'results', 'USAGE') AS can_read_results;
+
+\echo '01_analytics_scratch.sql finished.'
+```
+
+### 10c. Define and generate the cohorts in ATLAS
+
+Each study needs its cohorts **generated** on `SYNTH_OMOP`. The scripts stop with a clear
+message if a cohort has no rows. Lesson 007's lab builds the first two:
+
+| Cohort | Used by | Notes |
+|---|---|---|
+| `MHD adults (course)` | TreatmentPatterns target | Lesson 007, Part A |
+| `MHD + SUD (course)` | CohortContrast target | Lesson 007, Part B |
+| `MHD only` | CohortContrast control | MHD, with **exactly 0** SUD occurrences any time |
+| One cohort per treatment | TreatmentPatterns events | Entry = drug exposure of a concept set (e.g. an ATC class with descendants) |
+
+> **Check what Synthea actually prescribes first:** ATLAS → Data Sources → `SYNTH_OMOP` → **Drug
+> Exposure**. Synthea only generates the treatments its modules model, and our module only
+> assigns **diagnoses**, so some treatment classes may be empty. An empty event cohort is a
+> finding about the simulation, not a bug in the tool.
+
+### 10d. Study files
+
+A study file names the cohorts (by the ID in their ATLAS URL) and the settings. Copy an
+example, put in your IDs, and commit it.
+
+```bash
+cp services/analytics/studies/example-mhd-treatments.env services/analytics/studies/mhd-treatments.env
+```
+
+The variables are listed in `services/analytics/studies/README.md`.
+
+#### `services/analytics/studies/example-mhd-treatments.env`
+
+```dotenv
+# =============================================================================
+# example-mhd-treatments: TreatmentPatterns study (Step 10e)
+#
+# Question: after a first MHD diagnosis, which treatment cohorts do adults
+# go through, and in what order?
+#
+# The IDs below are PLACEHOLDERS. Replace them with your own ATLAS cohort IDs
+# (the number in the cohort's URL), generate each cohort on SYNTH_OMOP, then:
+#
+#   docker compose --profile analytics run --rm -e STUDY=example-mhd-treatments \
+#     analytics Rscript /app/run_treatment_patterns.R
+# =============================================================================
+
+# Target: e.g. "MHD adults (course)" from Lesson 007.
+TP_TARGET_COHORT_ID=1
+
+# Events: one cohort per treatment you want in the pathways, e.g. drug-class
+# cohorts built in ATLAS from concept sets (antidepressants, SUD medications …).
+# Check Data Sources → Drug Exposure first: Synthea only prescribes what its
+# modules model, so some classes may be empty in synthetic data.
+TP_EVENT_COHORT_IDS=2,3
+
+# Optional
+TP_MIN_CELL_COUNT=5
+```
+
+#### `services/analytics/studies/example-mhd-sud-vs-mhd.env`
+
+```dotenv
+# =============================================================================
+# example-mhd-sud-vs-mhd: CohortContrast study (Step 10f)
+#
+# Question: which concepts are over-represented in people with BOTH MHD and
+# SUD, compared with people with MHD only?
+#
+# The IDs below are PLACEHOLDERS. Replace them with your own ATLAS cohort IDs,
+# generate both cohorts on SYNTH_OMOP, then:
+#
+#   docker compose --profile analytics run --rm -e STUDY=example-mhd-sud-vs-mhd \
+#     analytics Rscript /app/run_cohort_contrast.R
+#
+# Remember: in synthetic data, any difference you find was put there by the
+# simulation (our module plus Synthea's own modules). That makes it a good
+# check of the simulation, and not evidence about real people.
+# =============================================================================
+
+# Target: e.g. "MHD + SUD (course)" from Lesson 007.
+CC_TARGET_COHORT_ID=4
+
+# Control: e.g. an "MHD only" cohort (MHD, with exactly 0 SUD occurrences).
+# Leave empty to let CohortContrast build matched controls instead.
+CC_CONTROL_COHORT_ID=5
+
+# Optional (defaults shown)
+CC_PREVALENCE_CUTOFF=2.5
+CC_PRESENCE_FILTER=0.2
+CC_NUM_CORES=1
+```
+
+### 10e. Run TreatmentPatterns
+
+```bash
+docker compose --profile analytics run --rm -e STUDY=mhd-treatments \
+  analytics Rscript /app/run_treatment_patterns.R
+```
+
+Output in `data/analyses/<RUN_ID>/treatment-patterns/mhd-treatments/`:
+
+- the CSV files from `TreatmentPatterns::export()` (pathways, counts by age/sex/year, attrition, event durations);
+- `sunburst.html` and `sankey.html` (each with a `*_files` folder next to it). Open them in your browser;
+- `provenance.json`.
+
+Counts below `TP_MIN_CELL_COUNT` (default 5) are **censored**. With about 1,200 synthetic
+patients, many paths will be small. That's the privacy habit to keep for real data, so lower it
+only for synthetic runs, and say so in the study file.
+
+#### `services/analytics/run_treatment_patterns.R`
+
+```r
+#' run_treatment_patterns.R: treatment pathways for one study (Step 10e)
+#'
+#' Question it answers: after entering the TARGET cohort, which EVENT cohorts
+#' (usually treatments) do people go through, in what order and combinations?
+#'
+#' Inputs: cohorts generated in ATLAS (results.cohort), chosen by ID in a
+#'   study file, e.g. services/analytics/studies/mhd-treatments.env:
+#'     TP_TARGET_COHORT_ID   one target cohort
+#'     TP_EVENT_COHORT_IDS   comma-separated event cohorts (the "treatments")
+#'     TP_EXIT_COHORT_IDS    optional, comma-separated exit cohorts
+#'     TP_MIN_CELL_COUNT     optional, default 5 (small counts are censored)
+#'     TP_MIN_ERA_DURATION, TP_COMBINATION_WINDOW, TP_MIN_POST_COMBINATION_DURATION
+#'                           optional; passed to computePathways() ONLY if set,
+#'                           otherwise the package's own defaults apply
+#'
+#' Outputs (data/analyses/<RUN_ID>/treatment-patterns/<STUDY>/):
+#'   CSV files from TreatmentPatterns::export(), sunburst.html and sankey.html
+#'   (if the plotting packages work), and provenance.json.
+#'
+#' Usage:
+#'   docker compose --profile analytics run --rm -e STUDY=mhd-treatments \
+#'     analytics Rscript /app/run_treatment_patterns.R
+#'
+#' @see https://darwin-eu.github.io/TreatmentPatterns/
+
+source("/app/R/common.R")
+
+suppressPackageStartupMessages(library(TreatmentPatterns))
+
+study <- load_study()
+cfg   <- analytics_config()
+tool  <- "treatment-patterns"
+
+# --- Which cohorts play which role -----------------------------------------
+target_id <- env_int("TP_TARGET_COHORT_ID")
+event_ids <- env_int_list("TP_EVENT_COHORT_IDS")
+exit_ids  <- env_int_list("TP_EXIT_COHORT_IDS")
+if (!length(event_ids)) stop("TP_EVENT_COHORT_IDS must list at least one event cohort.", call. = FALSE)
+
+overlap <- intersect(c(target_id), c(event_ids, exit_ids))
+if (length(overlap)) stop("A cohort can't be both target and event/exit: ", paste(overlap, collapse = ", "), call. = FALSE)
+
+# --- Check the cohorts exist and were generated; get their ATLAS names -----
+con  <- dbi_connection()
+info <- tryCatch(atlas_cohorts(con, c(target_id, event_ids, exit_ids)),
+                 finally = DBI::dbDisconnect(con))
+
+# TreatmentPatterns' cohort table: cohortId, cohortName, type.
+role <- function(id) if (id == target_id) "target" else if (id %in% exit_ids) "exit" else "event"
+cohorts <- data.frame(
+  cohortId   = info$cohort_id,
+  cohortName = info$cohort_name,
+  type       = vapply(info$cohort_id, role, character(1)),
+  stringsAsFactors = FALSE
+)
+
+# --- Optional pathway settings: pass ONLY the ones the study sets ----------
+# This avoids hard-coding defaults here that might differ from the package's.
+optional_settings <- list(
+  minEraDuration             = "TP_MIN_ERA_DURATION",
+  combinationWindow          = "TP_COMBINATION_WINDOW",
+  minPostCombinationDuration = "TP_MIN_POST_COMBINATION_DURATION"
+)
+settings <- list()
+for (arg in names(optional_settings)) {
+  value <- Sys.getenv(optional_settings[[arg]])
+  if (nzchar(value)) settings[[arg]] <- as.integer(value)
+}
+
+# --- Compute ---------------------------------------------------------------
+# DatabaseConnector route: TreatmentPatterns reads <resultSchema>.<cohortTableName>,
+# which is exactly where ATLAS writes generated cohorts (results.cohort).
+started <- Sys.time()
+andromeda <- do.call(TreatmentPatterns::computePathways, c(
+  list(
+    cohorts           = cohorts,
+    cohortTableName   = "cohort",
+    connectionDetails = jdbc_connection_details(),
+    cdmSchema         = cfg$cdm_schema,
+    resultSchema      = cfg$results_schema
+  ),
+  settings
+))
+
+# --- Export: CSVs + an R6 results object -----------------------------------
+out <- output_dir(cfg, tool, study)
+min_cell <- as.integer(env_or("TP_MIN_CELL_COUNT", "5"))
+results <- TreatmentPatterns::export(
+  andromeda    = andromeda,
+  outputPath   = out,
+  minCellCount = min_cell,
+  nonePaths    = TRUE      # also count people with NO treatment path; often the largest group
+)
+
+# --- Interactive plots (best effort) ----------------------------------------
+# selfcontained = FALSE: a self-contained HTML file needs pandoc, which this
+# image doesn't have. The plot then comes as an .html file plus a *_files folder.
+save_plot <- function(make_plot, file) {
+  tryCatch({
+    htmlwidgets::saveWidget(make_plot(), file.path(out, file), selfcontained = FALSE)
+    message(sprintf("[plot] %s", file.path(out, file)))
+  }, error = function(e) {
+    message(sprintf("[plot] skipped %s: %s (the CSVs are still complete)", file, conditionMessage(e)))
+  })
+}
+save_plot(function() results$plotSunburst(), "sunburst.html")
+save_plot(function() results$plotSankey(),   "sankey.html")
+
+write_provenance(
+  path     = out,
+  tool     = tool,
+  study    = study,
+  cohorts  = cohorts,
+  settings = c(settings, list(minCellCount = min_cell, nonePaths = TRUE)),
+  packages = c("TreatmentPatterns", "DatabaseConnector")
+)
+
+message(sprintf("[done] %s in %.1f minutes → %s", tool,
+                as.numeric(difftime(Sys.time(), started, units = "mins")), out))
+```
+
+### 10f. Run CohortContrast
+
+```bash
+docker compose --profile analytics run --rm -e STUDY=mhd-sud-vs-mhd \
+  analytics Rscript /app/run_cohort_contrast.R
+```
+
+Output in `data/analyses/<RUN_ID>/cohort-contrast/mhd-sud-vs-mhd/`: CohortContrast's study
+folder (parquet files, `metadata.json`) and `provenance.json`.
+
+Leave `CC_CONTROL_COHORT_ID` empty and CohortContrast builds **matched** controls instead
+(`CC_MATCH_RATIO` per target person).
+
+#### `services/analytics/run_cohort_contrast.R`
+
+```r
+#' run_cohort_contrast.R: concept enrichment, target vs control (Step 10f)
+#'
+#' Question it answers: which concepts (drugs, conditions, measurements …) are
+#' over-represented in the TARGET cohort compared with a CONTROL cohort?
+#'
+#' Inputs, from a study file (services/analytics/studies/<STUDY>.env):
+#'   CC_TARGET_COHORT_ID    one ATLAS cohort (generated)
+#'   CC_CONTROL_COHORT_ID   optional ATLAS cohort; if empty, CohortContrast builds
+#'                          MATCHED controls (CC_MATCH_RATIO per target person)
+#'   CC_MATCH_RATIO         optional, default 4
+#'   CC_DOMAINS             optional, comma-separated; default all eight domains
+#'   CC_PREVALENCE_CUTOFF   optional, default 2.5 (the package docs' example value)
+#'   CC_PRESENCE_FILTER     optional, default 0.2 (same)
+#'   CC_NUM_CORES           optional, default 1 (predictable in a container)
+#'
+#' Outputs (data/analyses/<RUN_ID>/cohort-contrast/<STUDY>/):
+#'   the CohortContrast study folder (parquet files + metadata.json) and
+#'   provenance.json. Explore it with the viewer (Step 10g).
+#'
+#' Usage:
+#'   docker compose --profile analytics run --rm -e STUDY=mhd-sud-vs-mhd \
+#'     analytics Rscript /app/run_cohort_contrast.R
+#'
+#' @see https://healthinformaticsut.github.io/CohortContrast/
+
+source("/app/R/common.R")
+
+suppressPackageStartupMessages({
+  library(CDMConnector)
+  library(CohortContrast)
+})
+
+study <- load_study()
+cfg   <- analytics_config()
+tool  <- "cohort-contrast"
+
+target_id  <- env_int("CC_TARGET_COHORT_ID")
+control_id <- env_int_list("CC_CONTROL_COHORT_ID")   # 0 or 1 values
+if (length(control_id) > 1) stop("CC_CONTROL_COHORT_ID takes at most one cohort.", call. = FALSE)
+
+domains <- strsplit(env_or("CC_DOMAINS",
+  "Drug,Condition,Measurement,Observation,Procedure,Visit,Visit detail,Death"), ",", fixed = TRUE)[[1]]
+domains <- trimws(domains)
+
+db <- dbi_connection()
+on.exit(DBI::dbDisconnect(db), add = TRUE)
+
+info <- atlas_cohorts(db, c(target_id, control_id))
+
+# --- CDM reference -----------------------------------------------------------
+# writeSchema: CohortContrast's docs describe it as a schema for temporary
+# tables that "will be deleted". So it gets its OWN throwaway schema
+# (analytics_scratch), never WebAPI's temp schema. The prefix keeps tables
+# identifiable if a run is interrupted.
+cdm <- CDMConnector::cdmFromCon(
+  con            = db,
+  cdmSchema      = cfg$cdm_schema,
+  achillesSchema = cfg$results_schema,
+  writeSchema    = c(schema = cfg$scratch_schema, prefix = "cc_")
+)
+
+# --- Target and control --------------------------------------------------------
+target_table <- CohortContrast::cohortFromCohortTable(
+  cdm = cdm, db = db, tableName = "cohort",
+  schemaName = cfg$results_schema, cohortId = target_id)
+
+if (length(control_id)) {
+  control_table <- CohortContrast::cohortFromCohortTable(
+    cdm = cdm, db = db, tableName = "cohort",
+    schemaName = cfg$results_schema, cohortId = control_id)
+  control_desc <- sprintf("ATLAS cohort %d", control_id)
+} else {
+  ratio <- as.integer(env_or("CC_MATCH_RATIO", "4"))
+  control_table <- CohortContrast::createControlCohortMatching(
+    cdm = cdm, targetTable = target_table, ratio = ratio)
+  control_desc <- sprintf("matched controls, ratio %d", ratio)
+}
+message(sprintf("[control] %s", control_desc))
+
+# --- Run -------------------------------------------------------------------
+# pathToResults is the PARENT folder; complName is the study folder inside it,
+# which CohortContrast creates itself (so we only create the parent).
+parent <- ensure_dir(file.path(cfg$output_root, tool))
+settings <- list(
+  domainsIncluded   = domains,
+  prevalenceCutOff  = as.numeric(env_or("CC_PREVALENCE_CUTOFF", "2.5")),
+  topK              = FALSE,
+  presenceFilter    = as.numeric(env_or("CC_PRESENCE_FILTER", "0.2")),
+  getSourceData     = FALSE,
+  runChi2YTests     = TRUE,
+  runLogitTests     = FALSE,
+  createOutputFiles = TRUE,
+  numCores          = as.integer(env_or("CC_NUM_CORES", "1"))
+)
+
+started <- Sys.time()
+data <- do.call(CohortContrast::CohortContrast, c(
+  list(
+    cdm                       = cdm,
+    targetTable               = target_table,
+    controlTable              = control_table,
+    pathToResults             = parent,
+    complementaryMappingTable = NULL,
+    complName                 = study
+  ),
+  settings
+))
+
+out <- file.path(parent, study)
+write_provenance(
+  path     = out,
+  tool     = tool,
+  study    = study,
+  cohorts  = info,
+  settings = c(settings, list(control = control_desc)),
+  packages = c("CohortContrast", "CDMConnector")
+)
+
+message(sprintf("[done] %s in %.1f minutes → %s", tool,
+                as.numeric(difftime(Sys.time(), started, units = "mins")), out))
+```
+
+### 10g. The CohortContrast viewer (to finish after the first run)
+
+CohortContrast's results viewer uses **Python** helpers (`configurePython()`,
+`installPythonDeps()`, `runCohortContrastViewer()`). The image includes Python, but the viewer's
+exact arguments (data folder, host, port) aren't in the documentation pages available so far.
+So this step starts with discovery, in the image you just built:
+
+```bash
+docker compose --profile analytics run --rm analytics Rscript -e \
+  "print(args(CohortContrast::runCohortContrastViewer)); print(args(CohortContrast::installPythonDeps))"
+```
+
+Then we add a viewer service like `atlas-proxy`: bound to `127.0.0.1` only, with the Python
+dependencies installed into a persistent folder rather than the container's throwaway `/tmp`.
+
+### 10h. Shared helpers
+
+#### `services/analytics/R/common.R`
+
+```r
+#' common.R: shared helpers for every analytics script (Step 10)
+#'
+#' Each run_<tool>.R script does source("/app/R/common.R") first, so the
+#' configuration, connection and safety-check logic lives in ONE place (DRY).
+#'
+#' Connection model
+#'   All analyses connect as the least-privilege role ohdsi_app (Step 9b):
+#'   it can READ cdm and results.cohort, WRITE results, and owns the scratch
+#'   schema. It cannot change clinical data, so a bug in an analysis package
+#'   can't damage the CDM.
+#'
+#' Environment (set on the analytics service in compose.yaml):
+#'   RUN_ID                          which load we're analysing (output folder)
+#'   DB_HOST, DB_NAME, DB_PORT       for DBI/RPostgres (CDMConnector)
+#'   DB_SERVER                       "host/dbname" form for DatabaseConnector
+#'   DB_USER, DB_PASSWORD            ohdsi_app credentials
+#'   STUDY                           name of a file in /app/studies/<STUDY>.env
+#'
+#' @see services/analytics/studies/README.md for the study-file format
+
+# ---------------------------------------------------------------------------
+# Small environment helpers
+# ---------------------------------------------------------------------------
+
+#' Read a required environment variable, failing with a clear message.
+#' @param name  Variable name.
+#' @return character(1)
+env_required <- function(name) {
+  value <- Sys.getenv(name)
+  if (!nzchar(value)) {
+    stop(sprintf("Environment variable %s is required but empty. See README Step 10.", name),
+         call. = FALSE)
+  }
+  value
+}
+
+#' Read an optional environment variable with a default.
+#' @param name     Variable name.
+#' @param default  Returned when unset or empty.
+#' @return character(1)
+env_or <- function(name, default) {
+  value <- Sys.getenv(name)
+  if (nzchar(value)) value else default
+}
+
+#' Read a comma-separated list of integers, e.g. "3, 4,5" -> c(3L, 4L, 5L).
+#' Empty -> integer(0). Anything that isn't an integer is an error, not a silent NA.
+#' @param name  Variable name.
+#' @return integer vector
+env_int_list <- function(name) {
+  raw <- gsub("\\s", "", Sys.getenv(name))
+  if (!nzchar(raw)) return(integer(0))
+  parts <- strsplit(raw, ",", fixed = TRUE)[[1]]
+  if (!all(grepl("^[0-9]+$", parts))) {
+    stop(sprintf("%s must be comma-separated integers, got '%s'.", name, raw), call. = FALSE)
+  }
+  as.integer(parts)
+}
+
+#' Read exactly one integer.
+#' @param name  Variable name.
+#' @return integer(1)
+env_int <- function(name) {
+  values <- env_int_list(name)
+  if (length(values) != 1) stop(sprintf("%s must be exactly one integer.", name), call. = FALSE)
+  values
+}
+
+# ---------------------------------------------------------------------------
+# Study files and configuration
+# ---------------------------------------------------------------------------
+
+#' Load /app/studies/<STUDY>.env into the environment.
+#' Study files hold cohort IDs and settings, so every analysis is a reviewable,
+#' version-controlled file rather than a command someone typed once.
+#' @return character(1) the study name
+load_study <- function() {
+  study <- env_required("STUDY")
+  if (!grepl("^[A-Za-z0-9_-]+$", study)) {
+    stop("STUDY may only contain letters, digits, _ and - (it's a file name).", call. = FALSE)
+  }
+  path <- file.path("/app/studies", paste0(study, ".env"))
+  if (!file.exists(path)) stop(sprintf("Study file not found: %s", path), call. = FALSE)
+  readRenviron(path)
+  message(sprintf("[study] loaded %s", path))
+  study
+}
+
+#' Fixed schema layout of this project, plus the run's output root.
+#' @return list
+analytics_config <- function() {
+  run_id <- env_required("RUN_ID")
+  list(
+    run_id         = run_id,
+    cdm_schema     = "cdm",                # CDM tables AND vocabulary
+    results_schema = "results",            # ATLAS writes generated cohorts to results.cohort
+    scratch_schema = "analytics_scratch",  # owned by ohdsi_app; safe to empty (Step 10b)
+    output_root    = file.path("/data/analyses", run_id)
+  )
+}
+
+#' Create (recursively) and return an output folder for one tool and study.
+#' Recursive on purpose: Achilles crashed because a parent folder was missing.
+#' @param cfg    From analytics_config().
+#' @param tool   e.g. "treatment-patterns".
+#' @param study  Study name.
+#' @return character(1) absolute path
+output_dir <- function(cfg, tool, study) {
+  ensure_dir(file.path(cfg$output_root, tool, study))
+}
+
+#' Create a folder (and any missing parents) and confirm it exists.
+#' @param path  Folder to create.
+#' @return character(1) the same path
+ensure_dir <- function(path) {
+  dir.create(path, recursive = TRUE, showWarnings = FALSE)
+  if (!dir.exists(path)) stop(sprintf("Could not create %s (check data/analyses ownership).", path), call. = FALSE)
+  path
+}
+
+# ---------------------------------------------------------------------------
+# Connections
+# ---------------------------------------------------------------------------
+
+#' DatabaseConnector (JDBC) details, as used by TreatmentPatterns and ETL-Synthea.
+#' @return connectionDetails
+jdbc_connection_details <- function() {
+  DatabaseConnector::createConnectionDetails(
+    dbms         = "postgresql",
+    server       = env_required("DB_SERVER"),
+    port         = as.integer(env_or("DB_PORT", "5432")),
+    user         = env_required("DB_USER"),
+    password     = env_required("DB_PASSWORD"),
+    pathToDriver = env_or("DATABASECONNECTOR_JAR_FOLDER", "/opt/jdbc")
+  )
+}
+
+#' DBI connection (RPostgres), as used by CDMConnector and CohortContrast.
+#' @return DBIConnection; the caller must DBI::dbDisconnect() it.
+dbi_connection <- function() {
+  DBI::dbConnect(
+    RPostgres::Postgres(),
+    host     = env_required("DB_HOST"),
+    dbname   = env_required("DB_NAME"),
+    port     = as.integer(env_or("DB_PORT", "5432")),
+    user     = env_required("DB_USER"),
+    password = env_required("DB_PASSWORD")
+  )
+}
+
+# ---------------------------------------------------------------------------
+# ATLAS cohorts: names and "was it generated?" check
+# ---------------------------------------------------------------------------
+
+#' Look up ATLAS cohort names, and refuse to continue if any cohort is unknown
+#' or has never been generated on this database.
+#'
+#' Why: every tool here reads results.cohort. A cohort that exists in ATLAS but
+#' was never generated has ZERO rows, and most tools then produce empty (or
+#' misleading) output instead of an error. Better to stop here, loudly.
+#'
+#' @param con  DBI connection.
+#' @param ids  Integer cohort definition IDs (from the ATLAS URL).
+#' @return data.frame(cohort_id, cohort_name, persons)
+atlas_cohorts <- function(con, ids) {
+  ids <- unique(as.integer(ids))
+  if (!length(ids) || anyNA(ids)) stop("No valid cohort IDs given.", call. = FALSE)
+
+  # IDs are validated integers, so inlining them is safe from SQL injection.
+  id_list <- paste(ids, collapse = ", ")
+  info <- DBI::dbGetQuery(con, sprintf("
+    SELECT cd.id   AS cohort_id,
+           cd.name AS cohort_name,
+           (SELECT COUNT(DISTINCT c.subject_id)
+              FROM results.cohort c
+             WHERE c.cohort_definition_id = cd.id) AS persons
+      FROM webapi.cohort_definition cd
+     WHERE cd.id IN (%s)
+     ORDER BY cd.id", id_list))
+
+  unknown <- setdiff(ids, info$cohort_id)
+  if (length(unknown)) {
+    stop(sprintf("Cohort ID(s) not found in ATLAS: %s", paste(unknown, collapse = ", ")), call. = FALSE)
+  }
+  empty <- info$cohort_id[info$persons == 0]
+  if (length(empty)) {
+    stop(sprintf(paste("Cohort ID(s) %s have no rows in results.cohort.",
+                       "Generate them on SYNTH_OMOP in ATLAS first."),
+                 paste(empty, collapse = ", ")), call. = FALSE)
+  }
+
+  message("[cohorts]")
+  for (i in seq_len(nrow(info))) {
+    message(sprintf("  %4d  %-50s %6d persons", info$cohort_id[i], info$cohort_name[i], info$persons[i]))
+  }
+  info
+}
+
+# ---------------------------------------------------------------------------
+# Provenance
+# ---------------------------------------------------------------------------
+
+#' Write provenance.json next to the results: what ran, on what, with which
+#' versions and settings. The analysis equivalent of a run-log entry.
+#' @param path      Output folder.
+#' @param tool      Tool name.
+#' @param study     Study name.
+#' @param cohorts   data.frame from atlas_cohorts().
+#' @param settings  Named list of the settings actually used.
+#' @param packages  Character vector of package names to record versions for.
+write_provenance <- function(path, tool, study, cohorts, settings, packages) {
+  cfg <- analytics_config()
+  versions <- vapply(packages, function(p) as.character(utils::packageVersion(p)), character(1))
+  jsonlite::write_json(
+    list(
+      tool      = tool,
+      study     = study,
+      run_id    = cfg$run_id,
+      timestamp = format(Sys.time(), "%Y-%m-%dT%H:%M:%S%z"),
+      r_version = as.character(getRversion()),
+      packages  = as.list(versions),
+      cohorts   = cohorts,
+      settings  = settings
+    ),
+    file.path(path, "provenance.json"),
+    auto_unbox = TRUE, pretty = TRUE
+  )
+  message(sprintf("[provenance] %s", file.path(path, "provenance.json")))
+}
+```
+
+---
+
 ## QA checklist
 
 ### For the engineer running the pipeline (admin)
@@ -2267,6 +3120,14 @@ They should match, or Atlas should be slightly *lower*: by default, Atlas counts
 - [ ] Achilles rerun after **every** ETL load, then WebAPI restarted
 - [ ] Smoke-test cohort count reconciles with the SQL count (9f)
 - [ ] Ports bound to `127.0.0.1` only (security is disabled in this setup)
+
+**If you run analyses (Step 10):**
+
+- [ ] The analytics image builds, and the package check prints TreatmentPatterns, CohortContrast and CDMConnector versions
+- [ ] Every cohort in a study file is **generated** on `SYNTH_OMOP` (the scripts stop otherwise)
+- [ ] Study files are committed; results under `data/analyses/` are not
+- [ ] Each result folder has a `provenance.json`; the run is noted in `docs/run-log.md`
+- [ ] Any lowered `TP_MIN_CELL_COUNT` is synthetic-only, and noted in the study file
 
 ### For the analyst using the database (non-admin)
 
@@ -2315,6 +3176,12 @@ They should match, or Atlas should be slightly *lower*: by default, Atlas counts
 | Data Sources shows **"Error loading report"** (Person, Procedure …), or is empty; search shows no RC/DRC counts | Achilles hasn't run (`results.achilles_*` missing), or hasn't run since the last load. The static `/atlas/…` requests in DevTools are fine (304 = cached); the failing one is a `/WebAPI/cdmresults/…` call returning 500 | Check `SELECT to_regclass('results.achilles_results');` (null = never ran). Run Step 9e, restart WebAPI, hard-refresh. Still failing? Read `docker compose --profile atlas logs webapi` |
 | Cohort generation fails: `permission denied for schema results` / `temp` | Grants missing (e.g. after a `down -v` and reload) | Rerun 01; it's idempotent |
 | Results DDL rerun: `relation … already exists` | The DDL is meant to run once | Harmless; skip it |
+| Step 10 script: `Cohort ID(s) … have no rows in results.cohort` | The cohort exists in ATLAS but wasn't generated (or was generated before a reload) | ATLAS → the cohort → **Generation** tab → Generate on `SYNTH_OMOP`; rerun |
+| Step 10 script: `Cohort ID(s) not found in ATLAS` | Wrong ID in the study file, or ATLAS was reset (`down -v` restarts IDs) | Check the number in the cohort's ATLAS URL; update the study file |
+| Step 10 script: `Study file not found` | `STUDY` doesn't match a file in `services/analytics/studies/` | `-e STUDY=name` without `.env`; letters, digits, `_` and `-` only |
+| Step 10: `Could not create /data/analyses/…` | `data/analyses` missing, or owned by root | `mkdir -p data/analyses` as yourself (Step 10b) |
+| Analytics build fails with `CANNOT LOAD <pkg>: …` (log still says `DONE (<pkg>)`) | The binary **installed** but a **system library** it links to is missing (e.g. networkD3 → igraph → `libglpk`) | The message names the missing `.so` file; add its `-dev` package to the Dockerfile's `apt-get` line and rebuild |
+| TreatmentPatterns: `sunburst.html` skipped | A plotting package failed | The CSVs are still complete; the error message names the cause |
 | Port 8080 already in use | Another local service | Set `ATLAS_PORT=8090` in `.env`; `WEBAPI_URL` and `SECURITY_ORIGIN` follow it automatically. Use the new port in the `curl` commands |
 
 ---
@@ -2348,6 +3215,7 @@ Lessons and lectures can be found in the [`lessons/`](lessons/) folder, complete
 | [008: Our ATLAS Setup and the UI](lessons/008_our-atlas-setup-and-the-ui.md) | Our stack end to end, WebAPI's two database jobs, following a click to a table, caches, real setup failures by layer, backups |
 | [009: From Synthea to the CDM, the ETL Internals](lessons/009_synthea-to-cdm-internals.md) | 2nd–3rd year: data contracts, staging, surrogate keys, visit roll-up and eras as gaps-and-islands, domain routing, idempotency/atomicity, ETL testing; labs rebuild parts of the ETL by hand |
 | [010: Athena and the Standardized Vocabularies](lessons/010_athena-and-the-vocabularies.md) | 2nd–3rd year: how the vocabularies are built and released (Feb/Aug; old releases not downloadable), the data model, standard concepts, mapping patterns, `concept_ancestor` as a transitive closure, upgrades, licensing, local 2-billion concepts; labs include a vocabulary audit of our own Synthea codes |
+| [011: Cohort Analytics](lessons/011_cohort-analytics.md) | 2nd–3rd year: characterization vs estimation vs prediction, cohorts as the interface between tools, 2×2 tables (RR, OR, φ), multiple testing, CohortContrast enrichment, the TreatmentPatterns algorithm step by step, Comorbidity4j and its biases, responsible reporting |
 
 Further reading:
 

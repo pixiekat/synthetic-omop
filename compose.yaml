@@ -193,5 +193,32 @@ services:
     volumes:
       - ./services/atlas/nginx.conf:/etc/nginx/conf.d/default.conf:ro
 
+  # ---------------------------------------------------------------------------
+  # analytics: R image with TreatmentPatterns and CohortContrast.
+  # Connects as the least-privilege ohdsi_app role (reads cdm + results.cohort,
+  # writes only results and analytics_scratch). Which cohorts and settings to
+  # use come from a committed study file: -e STUDY=<name>.
+  # ---------------------------------------------------------------------------
+  analytics:
+    profiles: ["analytics"]
+    build: ./services/analytics
+    depends_on:
+      omop-db:
+        condition: service_healthy
+    # Your host user, so results in ./data/analyses belong to you.
+    user: "${LOCAL_UID}:${LOCAL_GID}"
+    environment:
+      HOME: /tmp
+      RUN_ID: ${RUN_ID}
+      DB_HOST: omop-db                         # DBI/RPostgres form (CDMConnector)
+      DB_NAME: ${OMOP_DB_NAME}
+      DB_SERVER: omop-db/${OMOP_DB_NAME}       # DatabaseConnector "host/dbname" form
+      DB_PORT: "5432"                          # internal port, not the host port
+      DB_USER: ohdsi_app
+      DB_PASSWORD: ${OHDSI_APP_PASSWORD}
+    volumes:
+      - ./services/analytics:/app:ro           # scripts, helpers and study files
+      - ./data/analyses:/data/analyses         # results, per RUN_ID
+
 volumes:
   omop-pgdata:
