@@ -2346,6 +2346,8 @@ Lessons and lectures can be found in the [`lessons/`](lessons/) folder, complete
 | [006: Introduction to ATLAS](lessons/006_intro-to-atlas.md) | What ATLAS is for, its three parts, concept sets, cohorts and eras, a tour of the menu, pre-computed vs on-demand results |
 | [007: ATLAS Deep Dive](lessons/007_atlas-deep-dive.md) | Cohort logic (entry, inclusion, exit, eras), attrition reports, JSON → SQL via Circe, characterization, incidence, pathways, phenotype evaluation |
 | [008: Our ATLAS Setup and the UI](lessons/008_our-atlas-setup-and-the-ui.md) | Our stack end to end, WebAPI's two database jobs, following a click to a table, caches, real setup failures by layer, backups |
+| [009: From Synthea to the CDM, the ETL Internals](lessons/009_synthea-to-cdm-internals.md) | 2nd–3rd year: data contracts, staging, surrogate keys, visit roll-up and eras as gaps-and-islands, domain routing, idempotency/atomicity, ETL testing; labs rebuild parts of the ETL by hand |
+| [010: Athena and the Standardized Vocabularies](lessons/010_athena-and-the-vocabularies.md) | 2nd–3rd year: how the vocabularies are built and released (Feb/Aug; old releases not downloadable), the data model, standard concepts, mapping patterns, `concept_ancestor` as a transitive closure, upgrades, licensing, local 2-billion concepts; labs include a vocabulary audit of our own Synthea codes |
 
 Further reading:
 
