@@ -1,6 +1,9 @@
 # Secrets
 .env
 
+# Personal Claude Code overrides (the shared .claude/settings.json IS committed)
+.claude/settings.local.json
+
 # Everything under backups/ is not needed for the project to run. Keep the folder structure with .gitkeep files.
 backups/**
 !backups/**/
