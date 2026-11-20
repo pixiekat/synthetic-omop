@@ -2,6 +2,15 @@
   "$schema": "https://json.schemastore.org/claude-code-settings.json",
   "permissions": {
     "ask": [
+      "Bash(docker compose down:*)",
+      "Bash(docker compose up:*)",
+      "Bash(docker compose pull:*)",
+      "Bash(gh api:*)",
+      "Bash(gh workflow run:*)",
+      "Edit(.github/workflows/**)",
+      "Write(.github/workflows/**)"
+    ],
+    "deny": [
       "Bash(git commit:*)",
       "Bash(git push:*)",
       "Bash(git tag:*)",
@@ -18,13 +27,7 @@
       "Bash(gh issue comment:*)",
       "Bash(gh issue edit:*)",
       "Bash(gh release create:*)",
-      "Bash(gh workflow run:*)",
-      "Bash(gh api:*)",
       "Bash(docker compose down -v:*)",
-      "Edit(.github/workflows/**)",
-      "Write(.github/workflows/**)"
-    ],
-    "deny": [
       "Bash(git add -f:*)",
       "Bash(git add --force:*)"
     ]
